@@ -40,7 +40,7 @@ channel / filing / legal threat).
 
 ## Day windows (the current standard)
 
-- **Tier 1 window = 7 business days, with a Day-3 follow-up nudge.** Count **business** days, then
+- **Tier 1 window = 5 business days, with a Day-3 follow-up nudge.** Count **business** days, then
   sanity-check the calendar end date before sending. ("7 business days from a Friday" ≠ "+7 calendar
   days" — this is a documented, repeated error.)
 - Downstream tiers open on the **prior phase being marked cleared AND** the day threshold — both, not

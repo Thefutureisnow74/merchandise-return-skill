@@ -100,7 +100,7 @@ I am writing about a {{item}} ({{model}}, serial {{serial}}) I purchased from yo
 misuse, accident, or modification — the item failed to perform as sold.
 
 I am requesting a {{desired_outcome}}. Please confirm how you will resolve this, and the
-timeline, by {{deadline_date}} (7 business days). I would prefer to settle this directly
+timeline, by {{deadline_date}} (5 business days). I would prefer to settle this directly
 with you and expect that we can.
 
 Please reply to this email so we have a written record. My order details and a photo of the

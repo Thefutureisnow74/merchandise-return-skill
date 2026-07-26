@@ -94,9 +94,16 @@ REMEDY_MAP_PHASE = "RemedyMap"
 PHASE_SLA_DAYS = {
     "CaseFile": 2,
     "RemedyMap": 3,
-    "Tier1": 7,      # ladder.md: Tier 1 window = 7 business days, Day-3 nudge
-    "Tier2": 7,
-    "Tier3": 7,
+    # Tier 1/2 shortened 7 -> 5 business days (King, 2026-07-26). These are OUR policy, not law:
+    # nothing statutory sets a vendor's reply window. 5 business days is ~7-9 calendar days, still
+    # a reasonable opportunity to respond if the demand is ever tested in court, while cutting a
+    # full week out of the ladder. Anything shorter starts to read as manufactured.
+    # NOTE: this does NOT move an already-armed deadline. `MR Phase Deadline` is written on
+    # ENTERING a phase, so a case that was promised 7 business days in writing keeps them -- moving
+    # a goalpost we already put in a letter is the gate-jump this system exists to prevent.
+    "Tier1": 5,      # ladder.md: Tier 1 window = 5 business days, Day-3 nudge
+    "Tier2": 5,
+    "Tier3": 7,      # unchanged: Tier 3 waits on REGULATORS, and we do not set their clock
     # PreSuit is a STATUTORY notice period that varies by state (TX DTPA 60 calendar days,
     # CA CLRA 30). We never shorten a promised/required window, so the default clock is a
     # deliberately conservative 45 business days (~9 weeks) — longer than any state's notice
