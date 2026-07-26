@@ -625,12 +625,24 @@ if __name__ == "__main__":
         reset()
         check("reset() clears the singleton", _SINGLETON is None)
 
-        # 10) the shipped example files parse and validate
+        # 10) the shipped example files parse and validate.
+        #
+        # profile.example.json is REQUIRED — it is the schema every new user copies, so its
+        # absence is a broken package. Any *_profile.json.example is an OPERATOR template: a
+        # particular person's own filled-in profile, deliberately excluded from the distributed
+        # package (it contains their real identity). Requiring one would make a correctly
+        # sanitised package fail its own test suite — which it did, on the first fresh clone:
+        # 18 passed, 1 FAILED, and the failure was the packaging working as intended.
         here = os.path.dirname(os.path.abspath(__file__))
-        for ex in ("profile.example.json", "king_profile.json.example"):
+        examples = ["profile.example.json"]
+        examples += sorted(f for f in os.listdir(here)
+                           if f.endswith("_profile.json.example"))
+        for ex in examples:
             path = os.path.join(here, ex)
             if not os.path.isfile(path):
-                check("%s exists" % ex, False, "not found")
+                check("%s exists" % ex, ex != "profile.example.json",
+                      "not found (required)" if ex == "profile.example.json"
+                      else "not found (optional operator template — fine)")
                 continue
             try:
                 exp = load(path)
