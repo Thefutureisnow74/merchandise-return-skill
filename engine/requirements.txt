@@ -1,0 +1,47 @@
+# AMBS Merchandise Returns Engine — third-party Python dependencies
+# ------------------------------------------------------------------
+# Python 3.9+ (the VPS container runs /opt/hermes/.venv/bin/python3).
+#
+# The engine is stdlib-only BY DESIGN almost everywhere: Gmail send/read,
+# the Multica API client, the LLM provider ladder and every gate module use
+# urllib + smtplib only. The list below is the complete set of exceptions.
+#
+#   pip install -r requirements.txt              # required only
+#   pip install -r requirements.txt --no-deps    # if you manage pins yourself
+#
+# ---------------------------------------------------------------- REQUIRED
+# PyMuPDF (imported as `fitz`) — pdf_text.py imports it at module top level,
+# and mer_engine.py imports pdf_text at top level, so WITHOUT THIS THE
+# ORCHESTRATOR WILL NOT START. Not optional despite only being used for
+# denial-letter PDF attachments.
+PyMuPDF>=1.23
+
+# ---------------------------------------------------------------- OPTIONAL
+# Everything below is imported lazily inside image_text.py, guarded by
+# importlib.util.find_spec(). With none of them installed the engine still
+# runs; image attachments simply raise OCRUnavailableError and are logged as
+# unreadable rather than being silently treated as empty.
+#
+# Pillow — used to open image bytes for the pytesseract path and to build the
+# synthetic test image in `python image_text.py --self-test`.
+# Pillow>=10.0
+#
+# pytesseract — first OCR tier. ALSO NEEDS THE TESSERACT BINARY on PATH
+# (apt-get install tesseract-ocr); image_text.py calls
+# pytesseract.get_tesseract_version() and skips the tier if the binary is absent.
+# pytesseract>=0.3.10
+#
+# easyocr — second OCR tier, pure-python fallback (pulls in torch; large).
+# easyocr>=1.7
+#
+# openai — third tier ONLY. Used as a generic OpenAI-compatible client pointed
+# at Groq's vision endpoint (base_url=https://api.groq.com/openai/v1), NOT at
+# OpenAI. Needs GROQ_API_KEY. Not used anywhere else in the engine.
+# openai>=1.0
+
+# ------------------------------------------------------------------ SECRETS
+# No credential belongs in this repo. Supply at runtime (see scripts/vps/README.md):
+#   MER_GOOGLE_TOKEN_FILE  OAuth token JSON with client_id/client_secret/refresh_token
+#   MULTICA_TOKEN, MULTICA_WORKSPACE_ID   Multica API auth + board
+#   NANOGPT_API_KEY / MINIMAX_API_KEY     LLM classifier ladder (degrades to heuristic)
+#   GROQ_API_KEY                          optional OCR vision tier

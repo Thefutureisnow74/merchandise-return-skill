@@ -1,0 +1,72 @@
+{
+  "_readme": [
+    "profile.example.json — the Merchandise Returns Engine identity profile (Blueprint M32).",
+    "",
+    "Copy this file to 'profile.json', replace every value with YOUR OWN, and the engine runs",
+    "under your identity with zero code edits. The values below are a FICTIONAL example user.",
+    "",
+    "Where the engine looks for your profile, first hit wins:",
+    "  1. an explicit --config / path argument passed to the loader",
+    "  2. the $MER_PROFILE environment variable",
+    "  3. ./profile.json in the current working directory",
+    "  4. /opt/data/mer_profile.json  (the VPS default — a default, never an assumption)",
+    "",
+    "Keys beginning with an underscore are documentation and are ignored by the loader.",
+    "NEVER put a password, OAuth token or API key in this file. 'google_token_file' is a PATH",
+    "to the credential file, not the credential."
+  ],
+
+  "_fields": {
+    "legal_name": "REQUIRED. Your full legal name exactly as it should appear on a demand letter and on a small-claims petition. Every outbound letter is signed with this.",
+    "email": "REQUIRED. The mailbox the engine sends from and reads replies in. Must be the mailbox you OAuth-connected. Test-mode sends are redirected here.",
+    "phone": "Optional. E.164 format preferred. Used for the voice-escalation nag and printed on statutory demand letters. Omit or leave empty to disable voice escalation.",
+    "mailing_address": "Optional but strongly recommended. Your postal address, used on statutory pre-suit demand letters (many states require a mailable address). A string with newlines, or an array of lines.",
+    "state": "REQUIRED — NEVER DEFAULTED. Full state name, e.g. 'Ohio'. Decides your state Attorney General, your BBB region, your deceptive-trade-practices statute and your damages cap. The engine refuses to run without it rather than guess.",
+    "county": "REQUIRED — NEVER DEFAULTED. Your county of residence, without the word 'County'. Decides the small-claims / justice-court venue where a petition would actually be filed.",
+    "multica_workspace_id": "REQUIRED. The UUID of YOUR Multica workspace — the system of record for your cases. Find it with: multica workspace list --output json",
+    "multica_project_id": "Optional. UUID of a project inside that workspace to scope cases to. null = the whole workspace.",
+    "notify": "Optional. How the engine pings you. {'channel': 'telegram', 'telegram_chat_id': '<your numeric chat id>'} or {'channel': 'none'} for no push notifications. The chat id is not a secret; the bot TOKEN is, and lives in .env, never here.",
+    "signature_block": "Optional. Exactly how letters are signed, as a string with newlines or an array of lines. When omitted it defaults to your legal_name on one line and your email on the next.",
+    "calendar_id": "Optional. Google Calendar id that case deadlines sync to. Defaults to your 'email' when omitted.",
+    "google_token_file": "Optional. Filesystem PATH to the OAuth token JSON for your mailbox (never the token itself). Defaults to the VPS path /opt/data/<mailbox>_google_token.json.",
+    "llm_providers": "Optional (M36). An ORDERED LIST of OpenAI-compatible chat endpoints the reply classifier tries, top to bottom; when none answers it degrades to the deterministic heuristic and the engine keeps running. Omit this key entirely and you get the shipped default ladder (NanoGPT/GLM then MiniMax-M3) — identical to pre-M36 behavior. Set it to [] if you have no LLM at all; that is a supported, working (degraded) state, not an error. Each entry: {'name': label for logs, 'base_url': REQUIRED e.g. 'https://api.openai.com/v1' ('/chat/completions' is appended), 'model': REQUIRED e.g. 'gpt-4o-mini', 'api_key_env': the NAME of the env var holding your key — never the key itself, null for a keyless local server like Ollama; optional: 'max_tokens' (default 1500), 'reasoning' (default false), 'strip_think' (default true), 'temperature' (default 0), 'timeout' seconds (default 40), 'extra' object merged into the request body}. REASONING MODELS: set 'reasoning': true for a model that emits a <think> block before its answer (MiniMax-M3 does) — it floors max_tokens at 1500, which is the fix for the truncation bug where the whole answer was spent on reasoning. 'strip_think' removes that block before parsing and is ON for every provider by default. A provider whose api_key_env is not set is SKIPPED, so you can list several and only the ones you have keys for are used. $MER_LLM_PROVIDERS (inline JSON, a file path, or 'none') overrides this key; see scripts/vps/README.md -> 'LLM provider configuration'. NEVER put an actual API key here."
+  },
+
+  "legal_name": "Jordan A. Rivera",
+  "email": "jordan.rivera@example.com",
+  "phone": "+15125550147",
+  "mailing_address": [
+    "4120 Cedar Ridge Lane, Apt 5",
+    "Austin, TX 78745"
+  ],
+  "state": "Texas",
+  "county": "Travis",
+  "multica_workspace_id": "00000000-0000-4000-8000-000000000001",
+  "multica_project_id": null,
+  "notify": {
+    "channel": "telegram",
+    "telegram_chat_id": "5550001111"
+  },
+  "signature_block": [
+    "Jordan A. Rivera",
+    "jordan.rivera@example.com",
+    "(512) 555-0147"
+  ],
+  "calendar_id": "jordan.rivera@example.com",
+  "google_token_file": "/opt/data/jordan_rivera_google_token.json",
+  "llm_providers": [
+    {
+      "name": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "local-ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "llama3.1",
+      "api_key_env": null,
+      "reasoning": false
+    }
+  ]
+}
