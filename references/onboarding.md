@@ -104,7 +104,7 @@ A real dry run against a board that already carried the whole schema:
 ```
 === MERCHANDISE RETURNS ENGINE - §0 ONBOARDING (DRY RUN) ===
   ADOPTED  token       connection               verified - 7 workspace(s) visible
-  ADOPTED  workspace   Merchandise Return       id=121a54ba-... slug=merchandise-return
+  ADOPTED  workspace   Merchandise Return       id=a1b2c3d4-... slug=merchandise-return
   SKIPPED  project     My Return Cases          would CREATE (dry-run)
   ADOPTED  property    MR Phase                 id=12215804-... type=select
   ...
