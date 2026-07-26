@@ -47,6 +47,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/data/scripts")
 
 import dup_guard  # noqa: E402
+import refund_landed  # noqa: E402  (M44 — normalize_remedy is the single remedy vocabulary)
+
+# refund_landed's internal keys -> the `MR Remedy Type` select OPTION names (onboard.py).
+_REMEDY_OPTION = {"refund": "Refund", "replacement": "Replacement",
+                  "repair": "Repair", "store_credit": "StoreCredit"}
 
 # --------------------------------------------------------------------------------------
 # THE INTAKE STRUCTURE — references/intake-questionnaire.md, by question number.
@@ -237,6 +242,14 @@ def open_case(intake, *, api=None, issues=None, dry_run=True, project_id=None,
     }
     if not _blank(intake.get("jurisdiction")):
         props["MR Jurisdiction"] = intake["jurisdiction"]
+    # M44 — seed `MR Remedy Type` ONLY when intake 5.1 names exactly one remedy family.
+    # 5.1 asks for a RANKED list ("refund / replacement / repair / credit"), which names
+    # four; normalize_remedy returns None for that and the property is left blank. It is
+    # then set to whatever the vendor actually GRANTS. A blank value is safe — close_case
+    # holds — while a guessed one decides how the case closes.
+    rt = refund_landed.normalize_remedy(intake.get("desired_outcome"))
+    if rt:
+        props["MR Remedy Type"] = _REMEDY_OPTION[rt]
     verdict.update(title=title, description=description, properties=props)
 
     if dry_run:

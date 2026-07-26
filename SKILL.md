@@ -344,7 +344,7 @@ original sin that split this skill's two predecessors apart.
 ## Cross-references
 - `references/intake-questionnaire.md` · `references/ladder.md` · `references/court-and-chargeback.md`
   · `references/jurisdiction-lookup.md` · `references/inbound-triage.md` · `references/vendor-contacts.md`
-  · `references/letter-templates.md` · `references/money-trail.md`
+  · `references/letter-templates.md` · `references/money-trail.md` · `references/scheduler.md`
 
 ### §8.1 — Engine module roster (scripts/vps/, on the 24/7 VPS)
 Core loop: `mer_engine.py` (inbound→classify→resolution→draft→queue), `case_tick.py` (deadline
@@ -356,6 +356,11 @@ sweep), `send_queue.py` + `mer_send.py` (veto-window + gated send: off/test/live
 `remedy_gate.py` (court gate), `sol_watchdog.py` (statute-of-limitations), `dup_guard.py`,
 `sync_deadlines.py` + `multica_calendar_sync.py`, `delivery_check.py` (bounce), `run_tests.py`
 (green-before-ship), `refresh_sessions.py` (SOUL/skill reload advisor).
+**The clock:** `scheduler.py` + `schedule.json.example` — the declarative job manifest and the
+installer that registers it on cron, systemd timers, Windows Task Scheduler, or its own foreground
+loop. Every other module above is inert without it: nothing inside the engine can trigger on a
+non-event (a vendor's silence, a limitations date, a bounce that arrived after acceptance), and
+those are the failures that kill cases. `--dry-run` is the default; see `references/scheduler.md`.
 
 ## §8 — Engine modules & structural rules (the running parts)
 The skill's automation lives in `scripts/vps/` on the 24/7 VPS (see BLUEPRINT.md). Key rules:

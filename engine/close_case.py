@@ -71,13 +71,35 @@ def _verdict(**kw):
     return base
 
 
+def remedy_type_for(case, remedy=None, remedy_type=None):
+    """The remedy this case must prove landed, from the case's REAL board data first.
+
+    Precedence, and the reason for it:
+      1. `MR Remedy Type` on the issue — the board is the system of record (M44).
+      2. an explicit --remedy-type flag — the operator override for a case whose property
+         is not set yet.
+      3. the --remedy text, but ONLY if it names exactly one remedy family. A ranked
+         intake answer ("refund / replacement / repair / credit") names four and is
+         refused, not guessed.
+    Returns None when none of the three yields an unambiguous answer. None is a HOLD.
+    """
+    return (RL.remedy_type_from_case(case)
+            or RL.normalize_remedy(remedy_type)
+            or RL.normalize_remedy(remedy))
+
+
 def evaluate(case, remedy, vendor_reply, amounts, since, *,
-             gmail_search=None, human_confirm_file=RL.DEFAULT_CONFIRM_FILE, use_llm=False):
+             gmail_search=None, human_confirm_file=RL.DEFAULT_CONFIRM_FILE, use_llm=False,
+             remedy_type=None, tokens=None):
     """Run gates (A) and (B). Returns (may_close: bool, reason: str, resolution, refund).
 
     Never writes. Never raises for a missing input — a missing input is a HOLD with a
     reason, because "we could not check" and "it failed the check" must both keep the
     case open.
+
+    M44: gate (B) covers all four remedies. What counts as "cannot check" depends on the
+    remedy — a refund with no amount and a replacement with no tracking number are the same
+    failure wearing different clothes, and both hold.
     """
     ident = case.get("identifier") or case.get("id") or "case"
 
@@ -102,22 +124,37 @@ def evaluate(case, remedy, vendor_reply, amounts, since, *,
         return (False, "HOLD: M19 says the remedy was NOT actually granted — %s"
                 % resolution.get("reason", "no grant found"), resolution, None)
 
-    # --- (B) did the money actually land? -----------------------------------------------
-    if not amounts:
+    # --- (B) did the remedy actually land? ----------------------------------------------
+    rt = remedy_type_for(case, remedy, remedy_type)
+    if rt is None:
         return (False,
-                "HOLD (cannot check): no expected amount supplied, so M28 cannot confirm "
-                "any money posted. A refund case cannot close on an unspecified amount.",
+                "HOLD (cannot check): no unambiguous remedy type. Set `%s` on the issue to "
+                "one of %s (or pass --remedy-type). A ranked preference list is not a "
+                "decision and is never guessed." % (RL.REMEDY_TYPE_PROP,
+                                                    "/".join(RL.REMEDY_TYPES)),
+                resolution, None)
+    if rt in RL.MONEY_REMEDIES and not amounts:
+        return (False,
+                "HOLD (cannot check): %s is a money remedy and no expected amount was "
+                "supplied, so M28 cannot confirm anything posted. A money case cannot "
+                "close on an unspecified amount." % rt,
+                resolution, None)
+    if rt == "replacement" and not tokens:
+        return (False,
+                "HOLD (cannot check): a replacement needs a tracking / RMA identifier "
+                "(--token). Without one, any parcel on the thread would satisfy the gate.",
                 resolution, None)
     if _blank(since):
         return (False,
-                "HOLD (cannot check): no resolution date supplied; without it a credit "
-                "from BEFORE the dispute would count as the refund landing.",
+                "HOLD (cannot check): no resolution date supplied; without it something "
+                "that arrived BEFORE the dispute would count as the remedy landing.",
                 resolution, None)
     kw = {"human_confirm_file": human_confirm_file}
     if gmail_search is not None:
         kw["gmail_search"] = gmail_search
     try:
-        gate = RL.close_gate(case, amounts, since, resolution, **kw)
+        gate = RL.close_gate(case, amounts, since, resolution, remedy_type=rt,
+                             tokens=tokens, **kw)
     except Exception as exc:
         return (False, "HOLD (cannot check): the refund-landed gate failed to run (%s: %s). "
                 "A gate that cannot check must not let a case close."
@@ -125,9 +162,10 @@ def evaluate(case, remedy, vendor_reply, amounts, since, *,
     refund = gate["refund"]
     if any(e.get("source") == "gmail-error" for e in refund.get("evidence", [])) \
             and not refund.get("landed"):
-        return (False, "HOLD (cannot check): the mailbox could not be searched, so M28 has "
-                "no way to see whether %s posted. %s"
-                % (", ".join(refund.get("amounts", [])), gate["reason"]), resolution, refund)
+        return (False, "HOLD (cannot check): the mailbox could not be searched, so there is "
+                "no way to see whether the %s landed (%s). %s"
+                % (rt, ", ".join(refund.get("amounts") or refund.get("anchors") or ["-"]),
+                   gate["reason"]), resolution, refund)
     if not gate["may_close"]:
         return False, gate["reason"], resolution, refund
     return (True, "Gates cleared for %s: %s" % (ident, gate["reason"]), resolution, refund)
@@ -135,7 +173,8 @@ def evaluate(case, remedy, vendor_reply, amounts, since, *,
 
 def close_case(case, remedy, vendor_reply, amounts, since, *, confirm_close=False,
                api=None, dry_run=True, gmail_search=None,
-               human_confirm_file=RL.DEFAULT_CONFIRM_FILE, use_llm=False):
+               human_confirm_file=RL.DEFAULT_CONFIRM_FILE, use_llm=False,
+               remedy_type=None, tokens=None):
     """Close a case — only when (A) remedy granted AND (B) money landed AND (C) confirmed.
 
     Returns a verdict dict; `exit` carries the process exit code the CLI should use.
@@ -147,7 +186,8 @@ def close_case(case, remedy, vendor_reply, amounts, since, *, confirm_close=Fals
 
     may, reason, resolution, refund = evaluate(
         case, remedy, vendor_reply, amounts, since, gmail_search=gmail_search,
-        human_confirm_file=human_confirm_file, use_llm=use_llm)
+        human_confirm_file=human_confirm_file, use_llm=use_llm,
+        remedy_type=remedy_type, tokens=tokens)
 
     v = _verdict(case=ident, dry_run=bool(dry_run), resolution=resolution, refund=refund,
                  may_close=may, reason=reason)
@@ -416,6 +456,130 @@ def _selftest():
     except OSError:
         pass
 
+    # ---------------------------------------------------------------------------------
+    # M44 — the three non-money remedies now have a close path, and it is just as strict.
+    # ---------------------------------------------------------------------------------
+    _REPL_CASE = {"identifier": "TEST-R", "id": "test-r",
+                  "mr": {"MR Remedy Type": "Replacement"}}
+    _REPL_GRANTED = ("We are sorry about the fault. A replacement unit has been shipped to "
+                     "your address on file.")
+    _CARRIER_DELIVERED = [{
+        "id": "r1", "from": "auto-notify@ups.com", "subject": "Your package was delivered",
+        "date": "Sun, 03 Aug 2026 14:02:00 -0500",
+        "body": "Your replacement shipment 1Z999AA10123456784 was delivered and left at "
+                "the front door."}]
+    _CARRIER_IN_TRANSIT = [{
+        "id": "r2", "from": "auto-notify@ups.com", "subject": "Shipment created",
+        "date": "Fri, 01 Aug 2026 09:00:00 -0500",
+        "body": "Your replacement 1Z999AA10123456784 has shipped and is in transit."}]
+
+    # 8) A replacement with the parcel still in transit does NOT close.
+    s8 = _StubAPI()
+    v8 = close_case(_REPL_CASE, "replacement", _REPL_GRANTED, [], "2026-07-20",
+                    confirm_close=True, api=s8, dry_run=False, tokens=["1Z999AA10123456784"],
+                    gmail_search=_search(_CARRIER_IN_TRANSIT),
+                    human_confirm_file="/nonexistent")
+    print("\nTest 8 (replacement shipped but not delivered):\n   %s" % v8["reason"])
+    check("a replacement in transit does NOT close", v8["closed"] is False)
+    check("nothing written while the parcel is moving", s8.writes == [], repr(s8.writes))
+
+    # 9) ... and once the CARRIER says delivered, it closes. No amount anywhere.
+    s9 = _StubAPI()
+    v9 = close_case(_REPL_CASE, "replacement", _REPL_GRANTED, [], "2026-07-20",
+                    confirm_close=True, api=s9, dry_run=False, tokens=["1Z999AA10123456784"],
+                    gmail_search=_search(_CARRIER_DELIVERED),
+                    human_confirm_file="/nonexistent")
+    print("\nTest 9 (replacement delivered by the carrier):\n   %s" % v9["reason"])
+    check("a delivered replacement closes with NO amount", v9["closed"] is True,
+          v9["reason"][:90])
+    check("MR Phase=Closed then status=done", [w[0] for w in s9.writes]
+          == ["set_properties", "update_issue"], repr(s9.writes))
+
+    # 10) A replacement with no tracking identifier cannot be checked -> hold.
+    s10 = _StubAPI()
+    v10 = close_case(_REPL_CASE, "replacement", _REPL_GRANTED, [], "2026-07-20",
+                     confirm_close=True, api=s10, dry_run=False,
+                     gmail_search=_search(_CARRIER_DELIVERED),
+                     human_confirm_file="/nonexistent")
+    print("\nTest 10 (replacement, no tracking identifier):\n   %s" % v10["reason"])
+    check("no tracking id -> cannot check -> refused",
+          v10["closed"] is False and v10["exit"] == EXIT_CANNOT_CHECK,
+          "exit=%s" % v10["exit"])
+
+    # 11) A REPAIR needs the owner's word that it works — the carrier's is not enough.
+    _REPAIR_CASE = {"identifier": "TEST-P", "id": "test-p",
+                    "mr": {"MR Remedy Type": "Repair"}}
+    _REPAIR_GRANTED = ("The repair on your unit has been completed and it has been "
+                       "returned to you.")
+    _REPAIR_BACK = [{
+        "id": "p1", "from": "auto-notify@fedex.com", "subject": "Delivered",
+        "date": "Sun, 09 Aug 2026 11:00:00 -0500",
+        "body": "Repair RMA-88213 was delivered and signed for."}]
+    s11 = _StubAPI()
+    v11 = close_case(_REPAIR_CASE, "repair", _REPAIR_GRANTED, [], "2026-07-20",
+                     confirm_close=True, api=s11, dry_run=False, tokens=["RMA-88213"],
+                     gmail_search=_search(_REPAIR_BACK), human_confirm_file="/nonexistent")
+    print("\nTest 11 (repair unit back, working not verified):\n   %s" % v11["reason"])
+    check("a returned-but-unverified repair does NOT close", v11["closed"] is False)
+    check("nothing written on an unverified repair", s11.writes == [], repr(s11.writes))
+
+    # 11b) ... and the owner's confirmation closes it.
+    hcp = os.path.join(tempfile.gettempdir(), "close_case_m44_confirm.json")
+    with open(hcp, "w", encoding="utf-8") as fh:
+        json.dump({"TEST-P": [{"kind": "repair", "date": "2026-08-09", "confirmed": True,
+                               "token": "RMA-88213", "note": "tested, works"}]}, fh)
+    s11b = _StubAPI()
+    v11b = close_case(_REPAIR_CASE, "repair", _REPAIR_GRANTED, [], "2026-07-20",
+                      confirm_close=True, api=s11b, dry_run=False, tokens=["RMA-88213"],
+                      gmail_search=_search(_REPAIR_BACK), human_confirm_file=hcp)
+    print("\nTest 11b (repair confirmed working by the owner):\n   %s" % v11b["reason"])
+    check("an owner-verified repair closes", v11b["closed"] is True, v11b["reason"][:90])
+
+    # 12) STORE CREDIT: the amount must be named and a real credit artifact handed over.
+    _SC_CASE = {"identifier": "TEST-S", "id": "test-s",
+                "mr": {"MR Remedy Type": "StoreCredit"}}
+    _SC_GRANTED = "A store credit of $75.00 has been issued to your account."
+    _SC_PROMISE = [{
+        "id": "c1", "from": "care@vendorbeingpursued.example", "subject": "Your credit",
+        "date": "Mon, 03 Aug 2026 10:00:00 -0500",
+        "body": "A store credit of $75.00 will be issued to your account shortly."}]
+    _SC_ISSUED = [{
+        "id": "c2", "from": "care@vendorbeingpursued.example", "subject": "Your credit",
+        "date": "Mon, 03 Aug 2026 10:00:00 -0500",
+        "body": "A store credit of $75.00 has been added to your account. "
+                "Gift certificate code: SC-4KQ2-99XB1. It is available now."}]
+    s12 = _StubAPI()
+    v12 = close_case(_SC_CASE, "store credit", _SC_GRANTED, [75.00], "2026-07-20",
+                     confirm_close=True, api=s12, dry_run=False,
+                     gmail_search=_search(_SC_PROMISE), human_confirm_file="/nonexistent")
+    print("\nTest 12 (store credit promised, no code):\n   %s" % v12["reason"])
+    check("a promised store credit does NOT close", v12["closed"] is False)
+    check("nothing written on a credit promise", s12.writes == [], repr(s12.writes))
+
+    s12b = _StubAPI()
+    v12b = close_case(_SC_CASE, "store credit", _SC_GRANTED, [75.00], "2026-07-20",
+                      confirm_close=True, api=s12b, dry_run=False,
+                      gmail_search=_search(_SC_ISSUED), human_confirm_file="/nonexistent")
+    print("\nTest 12b (store credit issued with a code):\n   %s" % v12b["reason"])
+    check("an issued store credit with a code closes", v12b["closed"] is True,
+          v12b["reason"][:90])
+
+    # 13) A case whose remedy type is UNSET and which has no amount cannot be checked.
+    s13 = _StubAPI()
+    v13 = close_case({"identifier": "TEST-U", "id": "test-u"}, "refund or replacement",
+                     _GRANTED_REPLY, [], "2026-07-20", confirm_close=True, api=s13,
+                     dry_run=False, gmail_search=_search(_BANK_POSTED),
+                     human_confirm_file="/nonexistent")
+    print("\nTest 13 (ambiguous remedy, no amount):\n   %s" % v13["reason"])
+    check("an ambiguous remedy type is never guessed",
+          v13["closed"] is False and v13["exit"] == EXIT_CANNOT_CHECK,
+          "exit=%s" % v13["exit"])
+    check("nothing written on an unknown remedy type", s13.writes == [])
+    try:
+        os.remove(hcp)
+    except OSError:
+        pass
+
     print("")
     for status, name, detail in results:
         print("[%s] %s%s" % (status, name,
@@ -431,7 +595,16 @@ def main(argv=None):
                     help="offline self-test: stubbed API, fabricated data, no network")
     ap.add_argument("--case", help="case identifier on the board, e.g. CASE-1")
     ap.add_argument("--remedy", default="refund",
-                    help="the remedy that was DEMANDED (refund/replacement/repair/trace)")
+                    help="the remedy that was DEMANDED, in the words used to the vendor. "
+                         "This is M19's input — what the reply is tested against.")
+    ap.add_argument("--remedy-type", default=None,
+                    help="override for gate (B): refund | replacement | repair | "
+                         "store_credit. Normally read from `%s` on the issue; this flag "
+                         "exists for a case whose property is not set yet."
+                         % RL.REMEDY_TYPE_PROP)
+    ap.add_argument("--token", action="append", default=[], dest="tokens",
+                    help="tracking number / RMA / credit code; repeat. Required to close a "
+                         "replacement.")
     ap.add_argument("--reply-file", help="file holding the vendor's reply text (M19 input)")
     ap.add_argument("--amount", action="append", default=[],
                     help="expected amount; repeat for multiple credits (ALL must land)")
@@ -467,7 +640,8 @@ def main(argv=None):
 
     try:
         v = close_case(case, a.remedy, reply, a.amount, a.since,
-                       confirm_close=a.confirm_close, dry_run=not a.live, use_llm=a.llm)
+                       confirm_close=a.confirm_close, dry_run=not a.live, use_llm=a.llm,
+                       remedy_type=a.remedy_type, tokens=a.tokens)
     except Exception as exc:
         print("HOLD (cannot check): the close path failed (%s: %s)."
               % (type(exc).__name__, exc))
@@ -479,8 +653,10 @@ def main(argv=None):
                                             v["resolution"].get("reason", "")[:120]))
     if v["refund"]:
         r = v["refund"]
-        print("  M28 landed   : %s (confidence %s) for %s since %s"
-              % (r["landed"], r["confidence"], ", ".join(r["amounts"]), r["since"]))
+        print("  remedy       : %s" % (r.get("remedy_type") or "(unset)"))
+        print("  M28/M44      : landed=%s (confidence %s) for %s since %s"
+              % (r["landed"], r["confidence"],
+                 ", ".join(r.get("amounts") or r.get("anchors") or ["-"]), r["since"]))
         for e in r["evidence"]:
             print("    evidence   : [%s] %s"
                   % (e.get("source"), (e.get("detail") or e.get("snippet")

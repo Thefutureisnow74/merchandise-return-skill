@@ -309,7 +309,7 @@ if __name__ == "__main__":
 
     img = Image.new("RGB", (620, 110), "white")
     draw = ImageDraw.Draw(img)
-    draw.text((10, 10), "AMEX Assurance Company  Claim 12393058", fill="black")
+    draw.text((10, 10), "Example Assurance Company  Claim 10000001", fill="black")
     draw.text((10, 45), "Outcome: your refund request was DENIED.", fill="black")
     draw.text((10, 78), "Reason: DENIED - out of time.", fill="black")
     buf = io.BytesIO()
@@ -330,7 +330,7 @@ if __name__ == "__main__":
 
     print("extracted:", repr(txt[:240]))
     up = txt.upper()
-    if "DENIED" in up and "12393058" in txt.replace(" ", ""):
+    if "DENIED" in up and "10000001" in txt.replace(" ", ""):
         print("PASS — image attachments are now readable; a decision in a photo is visible.")
     else:
         print("WARN — a backend ran but the expected text was not recovered cleanly.")

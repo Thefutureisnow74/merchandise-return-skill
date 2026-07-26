@@ -42,8 +42,23 @@ import mer_config            # noqa: E402  (M32 — identity comes from the prof
 import multica_api as mc     # noqa: E402  (M33 — the board is the case list)
 import case_queries          # noqa: E402  (M33 — one shared query resolver, no local table)
 
-STATE_FILE = "/opt/data/inbox_watcher_state.json"
-OUT_FILE = "/opt/data/multica_inbound.json"
+def _data_dir():
+    """Where this watcher's state lives. Config first, host default second, never a literal
+    at a call site — the package ships to machines that have no /opt/data."""
+    d = os.environ.get("MER_DATA_DIR")
+    if d:
+        return d
+    if os.path.isdir("/opt/data"):
+        return "/opt/data"
+    base = os.environ.get("XDG_STATE_HOME") or os.environ.get("LOCALAPPDATA") \
+        or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "merchandise-return")
+
+
+STATE_FILE = os.environ.get("MER_INBOX_WATCHER_STATE") \
+    or os.path.join(_data_dir(), "inbox_watcher_state.json")
+OUT_FILE = os.environ.get("MER_INBOX_OUT") \
+    or os.path.join(_data_dir(), "multica_inbound.json")
 LOOKBACK = "newer_than:14d"     # bound the query so seen-sets stay small
 MAX_RESULTS = 10                # per case, per run
 MAX_REPORT = 15                 # cap total surfaced items so a chatty case can't flood
@@ -64,9 +79,18 @@ MAX_REPORT = 15                 # cap total surfaced items so a chatty case can'
 #   * a case with no derivable vendor address/domain is SKIPPED and logged, never given a broad
 #     fallback query.
 #
-# STILL REPORT-ONLY. case_queries imports nudge for its description parser (nudge in turn imports
-# the send queue), but nothing on this path is ever CALLED here: this file has no send, no reply,
-# no label, no board write. Keep it that way.
+# STILL REPORT-ONLY — AND NOW STRUCTURALLY SO (M10).
+#
+# This file once reached `nudge` through `case_queries` (nudge in turn imports the send queue), so
+# a read-only watcher had a live send function sitting in its own process, one attribute lookup
+# away. "Nothing calls it" is not a boundary; it is a promise. That import was inverted out, and
+# `--selftest` now WALKS THE TRANSITIVE IMPORT GRAPH of this module and fails if `nudge`,
+# `send_queue` or `mer_send` reappears anywhere in it. If you add an import here and the self-test
+# goes red, the fix is to move the function you wanted, not to widen the allowlist.
+#
+# `gmail_transport` IS imported, and is the one thing on this path that can put mail on the wire.
+# It is here only for its self-refreshing access_token(); the watcher never calls send_mime(). That
+# is the known, bounded exception — do not make it worse by adding a second one.
 
 
 def load_case_queries():
@@ -127,7 +151,7 @@ def _notify(items):
     so the 3-hourly run surfaces new mail within hours instead of at the next nag."""
     env = {}
     try:
-        for line in open("/opt/data/.env"):
+        for line in open(os.path.join(_data_dir(), ".env")):
             s = line.strip()
             if s and not s.startswith("#") and "=" in s:
                 k, v = s.split("=", 1)
@@ -215,6 +239,9 @@ def main():
         "new_mail": new_items[:MAX_REPORT],
         "truncated": truncated,
     }
+    for _d in {os.path.dirname(OUT_FILE), os.path.dirname(STATE_FILE)}:
+        if _d:
+            os.makedirs(_d, exist_ok=True)   # a fresh non-VPS host has no state dir yet
     with open(OUT_FILE, "w", encoding="utf-8") as fh:
         json.dump(out, fh, indent=2, ensure_ascii=False)
     state["seen"] = seen
@@ -230,5 +257,122 @@ def main():
               % (len(new_items), len(queries), OUT_FILE))
 
 
+# ------------------------------------------------------------------------------- selftest
+
+_BANNED_IMPORTS = ("nudge", "send_queue", "mer_send")
+
+
+def _local_modules():
+    """Module name -> path, for the engine modules that sit beside this file."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return {f[:-3]: os.path.join(here, f) for f in os.listdir(here)
+            if f.endswith(".py") and not f.startswith("_")}
+
+
+def import_graph(root, mods=None):
+    """Every engine module reachable from `root` by import, transitively.
+
+    Deliberately static (AST), not dynamic: a runtime check would only see what happened to be
+    imported on the path the test took, and the point is to constrain what CAN be reached.
+    """
+    import ast
+    mods = mods or _local_modules()
+    seen, stack = set(), [root]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in mods:
+            continue
+        seen.add(name)
+        try:
+            tree = ast.parse(open(mods[name], encoding="utf-8").read())
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    stack.append(a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                stack.append(node.module.split(".")[0])
+    seen.discard(root)
+    return seen
+
+
+def _selftest():
+    """Offline. No network, no mailbox, no board, and — provably — no send path."""
+    fails = []
+
+    def ck(name, cond, detail=""):
+        print("  [%s] %s%s" % ("PASS" if cond else "FAIL", name,
+                               "" if cond else "  <- " + str(detail)))
+        if not cond:
+            fails.append(name)
+
+    print("inbox_watcher --selftest  (offline)")
+    print("-" * 70)
+
+    print("A. dependency inversion — a READ-ONLY watcher may not reach a send path")
+    graph = import_graph("inbox_watcher")
+    for banned in _BANNED_IMPORTS:
+        ck("cannot reach %s (transitively)" % banned, banned not in graph,
+           "reachable via: %s" % sorted(graph))
+    # CONTROL: a green result above must mean "the watcher is clean", not "the walker is blind".
+    # mer_engine legitimately owns the send path, so the same walker MUST find it there.
+    ck("the walker is not vacuously green (it finds send_queue in mer_engine)",
+       "send_queue" in import_graph("mer_engine"), sorted(import_graph("mer_engine")))
+    ck("import graph is small and known",
+       graph <= {"gmail_transport", "mer_config", "multica_api", "case_queries",
+                 "businessday", "llm_providers"}, sorted(graph))
+    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    body = src.split("def _selftest")[0]
+    # Comments discuss the boundary; only code can cross it.
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
+    for verb in ("send_mime(", "add_comment(", "set_property(", "update_issue("):
+        ck("never calls %s" % verb, verb not in code)
+
+    print("B. state-key migration (a rename must not replay two weeks of mail)")
+    seen = {"MER-1 (GHL / Stride)": ["a", "b"], "MER-3": ["c"]}
+    out = _migrate_state_keys(dict(seen), ["MER-1", "MER-3", "MER-9"])
+    ck("legacy label key adopted onto the bare identifier", out.get("MER-1") == ["a", "b"], out)
+    ck("already-bare key untouched", out.get("MER-3") == ["c"], out)
+    ck("an unknown identifier gets no invented history", "MER-9" not in out, out)
+
+    print("C. portability — no host path, no identity baked in")
+    import ast
+    import re as _re
+    tree = ast.parse(src)
+    exempt = [(n.lineno, n.end_lineno) for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name in ("_data_dir", "_selftest")]
+    strays = [n.value for n in ast.walk(tree)
+              if isinstance(n, ast.Constant) and isinstance(n.value, str)
+              and n.value.startswith("/opt/")
+              and not any(a <= n.lineno <= b for a, b in exempt)]
+    ck("no host path outside _data_dir()", not strays, strays)
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
+    ck("no email address literal in code",
+       not _re.search(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}", code))
+    ck("state paths are env-overridable",
+       "MER_INBOX_WATCHER_STATE" in body and "MER_INBOX_OUT" in body)
+
+    print("D. config resolution works with nothing configured")
+    import tempfile
+    prev = os.environ.get("MER_DATA_DIR")
+    os.environ["MER_DATA_DIR"] = tempfile.mkdtemp(prefix="inbox_watcher_selftest_")
+    ck("_data_dir honours MER_DATA_DIR", _data_dir() == os.environ["MER_DATA_DIR"])
+    os.environ.pop("MER_DATA_DIR")
+    ck("_data_dir falls back to a real writable location without config",
+       isinstance(_data_dir(), str) and _data_dir() != "")
+    if prev is not None:
+        os.environ["MER_DATA_DIR"] = prev
+
+    print("-" * 70)
+    if fails:
+        print("SELF-TEST FAILED: %s" % ", ".join(fails))
+        return 1
+    print("PASS — inbox_watcher self-test green (offline; report-only proven structurally).")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     main()

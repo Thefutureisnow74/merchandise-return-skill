@@ -55,6 +55,10 @@ KNOWN = [
     {"file": "resolution_check.py", "llm_tolerant": False},
     {"file": "businessday.py",      "llm_tolerant": False},   # may appear later
     {"file": "remedy_gate.py",      "llm_tolerant": False},   # may appear later
+    # M44 — both were self-tested from day one and neither was ever in this list, so a
+    # regression in the CLOSE gate or the duplicate gate would not have failed a run.
+    {"file": "refund_landed.py",    "llm_tolerant": False},
+    {"file": "dup_guard.py",        "llm_tolerant": False},
     {"file": "classify_llm.py",     "llm_tolerant": True},
     # --- config + orchestrator (M38: already self-tested, never wired in) ----
     {"file": "mer_config.py",       "llm_tolerant": False},
@@ -67,6 +71,16 @@ KNOWN = [
     {"file": "close_case.py",       "llm_tolerant": False, "args": ["--selftest"]},
     # M41 — proves the engine runs as someone who is NOT King. Guards the product promise.
     {"file": "fresh_profile_check.py", "llm_tolerant": False},
+    # THE CLOCK. Its self-test installs nothing and touches no real crontab / Task Scheduler:
+    # the cron backend runs against an injected in-memory table and systemd against a temp dir.
+    # It also asserts that neither scheduler.py nor the job manifest carries a host path, a
+    # container name or an identity — the property that makes the package shippable at all.
+    {"file": "scheduler.py",        "llm_tolerant": False, "args": ["--selftest"]},
+    # M10 hot path + the read-only watcher. BOTH must be invoked with --selftest: bare
+    # inbox_watcher.py reads the live mailbox and writes state, and bare mer_hotpath.py
+    # dispatches the real engine.
+    {"file": "mer_hotpath.py",      "llm_tolerant": False, "args": ["--selftest"]},
+    {"file": "inbox_watcher.py",    "llm_tolerant": False, "args": ["--selftest"]},
     {"file": "case_tick.py",        "llm_tolerant": False, "args": ["--selftest"]},
     # --- THE SEND PATH (M38: new self-tests; all offline, none can send) -----
     {"file": "send_queue.py",       "llm_tolerant": False, "args": ["--selftest"]},

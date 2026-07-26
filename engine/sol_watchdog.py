@@ -133,7 +133,7 @@ STATE_NAMES = {
 def resolve_state(text):
     """Extract a 2-letter US state code from a free-text 'MR Jurisdiction' value.
 
-    Handles 'TX / Dallas County', 'CA / Los Angeles', 'TX (Texas Riverside...)',
+    Handles 'TX / Dallas County', 'CA / Los Angeles', 'TX (Example Holdings...)',
     'Unconfirmed - likely CA (310 area code)', 'California', etc.
 
     Returns (code|None, confident_bool). confident is False when the text hedges

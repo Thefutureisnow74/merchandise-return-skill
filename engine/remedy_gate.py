@@ -117,7 +117,75 @@ def summarize(remedy_map, attempted, case=None):
     return "\n".join(lines)
 
 
+def _gate_cli(argv):
+    """M44: the Tier-4 gate as a command, for the human path.
+
+    The gate already runs inside case_tick.gate_check() (GATE 4) on every tick, but the
+    person who is about to walk into a courthouse cannot read a cron log. This answers the
+    question directly, for one case, from the case's REAL board properties.
+
+        python3 remedy_gate.py --check --case CASE-1
+        python3 remedy_gate.py --check --map tier1_vendor,bbb --attempted tier1_vendor
+
+    Exit 0 = court may open. Exit 2 = HELD, levers still owed. Exit 3 = the gate could not
+    run (board unreachable, no map on the case). Exit 3 is a HOLD too: an unrunnable gate
+    must never read as permission.
+    """
+    import argparse
+    import os
+    import sys as _sys
+    ap = argparse.ArgumentParser(description="M14 Tier-4 (court) remedy gate")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--case", help="case identifier on the board, e.g. CASE-1")
+    ap.add_argument("--map", dest="rmap", default=None,
+                    help="comma-separated lever keys applicable to this case "
+                         "(offline mode; omit to read `MR Remedy Map` off the board)")
+    ap.add_argument("--attempted", default=None,
+                    help="comma-separated lever keys done AND logged (offline mode)")
+    a = ap.parse_args(argv)
+
+    def _split(v):
+        return [x.strip() for x in str(v or "").replace("\n", ",").replace(";", ",").split(",")
+                if x.strip()]
+
+    if a.rmap is not None:
+        rmap, done, label = _split(a.rmap), _split(a.attempted), a.case or "(offline)"
+    else:
+        if not a.case:
+            print("HOLD — give either --case (read the board) or --map/--attempted "
+                  "(offline). With neither there is nothing to check, and nothing checked "
+                  "is never a clearance.")
+            return 3
+        try:
+            _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import multica_api as mc
+            hit = next((it for it in mc.list_issues()
+                        if it.get("identifier") == a.case or it.get("id") == a.case), None)
+            if hit is None:
+                raise LookupError("no issue with identifier/id %r" % a.case)
+            p = hit.get("mr", {}) or {}
+            rmap, done = _split(p.get("MR Remedy Map")), _split(p.get("MR Remedy Attempted"))
+            label = a.case
+        except Exception as exc:
+            print("HOLD — could not read %s off the board (%s: %s). A gate that cannot read "
+                  "the case must not open court." % (a.case, type(exc).__name__, exc))
+            return 3
+
+    if not rmap:
+        print("HOLD — %s has an EMPTY MR Remedy Map. An empty map means the levers were "
+              "never enumerated, NOT that none apply. Run Tier 0 (remedy_map.py) first."
+              % label)
+        return 3
+
+    print(summarize(rmap, done, case=label))
+    return 0 if remedy_complete(rmap, done)["ready_for_court"] else 2
+
+
 if __name__ == "__main__":
+    import sys
+    if "--check" in sys.argv:
+        sys.exit(_gate_cli(sys.argv[1:]))
+
     # --- Self-test 1: 6-lever map, 5 attempted -> not ready, 6th is missing ---
     remedy_map = [
         "tier1_vendor", "tier2_exec", "industry_regulator",

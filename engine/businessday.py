@@ -107,7 +107,82 @@ def business_day_deadline(start_date, n):
     return add_business_days(start_date, n)
 
 
+def _deadline_cli(argv):
+    """M44: business-day arithmetic as a command, for the human path.
+
+    case_tick already calls business_day_deadline() when it arms a phase clock, but a
+    person drafting a letter by hand needs the same answer without running the tick. The
+    PPG incident (MER-3) is exactly this: "seven (7) business days" was computed as seven
+    CALENDAR days and the deadline was wrong by two days.
+
+        python3 businessday.py --deadline 7
+        python3 businessday.py --deadline 7 --from 2026-07-17
+        python3 businessday.py --is-business-day 2026-07-03
+
+    Exit 0 on a computed answer, 3 when it cannot compute one. It refuses a negative or
+    unparseable day count rather than emitting a date that would silently be wrong — a
+    wrong deadline is worse than no deadline, because it looks like an answer.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(description="US business-day deadline arithmetic")
+    ap.add_argument("--deadline", type=str, default=None,
+                    help="number of BUSINESS days from --from (default: today)")
+    ap.add_argument("--from", dest="start", default=None, help="start date YYYY-MM-DD")
+    ap.add_argument("--is-business-day", dest="probe", default=None,
+                    help="ask whether one date is a business day")
+    a = ap.parse_args(argv)
+
+    def _parse(s):
+        from datetime import datetime
+        return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d").date()
+
+    if a.probe:
+        try:
+            d = _parse(a.probe)
+        except ValueError:
+            print("CANNOT ANSWER — %r is not a YYYY-MM-DD date." % a.probe)
+            return 3
+        ok = is_business_day(d)
+        print("%s is %s (%s)" % (d, "a BUSINESS day" if ok else "NOT a business day",
+                                 d.strftime("%A")))
+        return 0
+
+    if a.deadline is None:
+        print("CANNOT ANSWER — give --deadline N (business days) or --is-business-day DATE.")
+        return 3
+    try:
+        n = int(a.deadline)
+    except ValueError:
+        print("CANNOT ANSWER — --deadline must be a whole number of business days, got %r."
+              % a.deadline)
+        return 3
+    if n < 0:
+        print("CANNOT ANSWER — a deadline cannot be a negative number of business days.")
+        return 3
+    try:
+        start = _parse(a.start) if a.start else date.today()
+    except ValueError:
+        print("CANNOT ANSWER — --from %r is not a YYYY-MM-DD date." % a.start)
+        return 3
+
+    due = business_day_deadline(start, n)
+    naive = start + timedelta(days=n)
+    print("%d business day(s) from %s (%s)  ->  %s (%s)"
+          % (n, start, start.strftime("%a"), due, due.strftime("%a")))
+    if due != naive:
+        print("  (a calendar +%d would have said %s — %d day(s) too early; that error is "
+              "the MER-3 incident)" % (n, naive, (due - naive).days))
+    skipped = sorted(d for d in _holidays_for(start) if start < d <= due)
+    if skipped:
+        print("  holidays skipped: %s" % ", ".join(str(d) for d in skipped))
+    return 0
+
+
 if __name__ == "__main__":
+    import sys
+    if "--deadline" in sys.argv or "--is-business-day" in sys.argv:
+        sys.exit(_deadline_cli(sys.argv[1:]))
+
     # --- The known-correct case from the PPG incident (MER-3) ---
     # Tier-1 letter sent Fri 2026-07-17 gave "seven (7) BUSINESS days".
     # 7 business days from Fri 7/17 = end of Tue 2026-07-28 (NOT +7 calendar = 7/24).

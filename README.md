@@ -53,7 +53,17 @@ python engine/onboard.py            # dry-run: shows exactly what it would creat
 python engine/onboard.py --live     # provisions your workspace, project and case properties
 python engine/gmail_connect.py --help-setup   # one-time Google setup, then connect your mailbox
 python engine/run_tests.py          # everything should be green before you trust it
+python engine/scheduler.py --install        # dry-run: the clock, and what it would register
+python engine/scheduler.py --install --live # give the engine a clock
 ```
+
+**Do not skip the last one.** Without a clock the engine only acts while you are sitting in front
+of it, and the failures that kill a return case are non-events: a vendor's silence, a limitations
+date, a letter that bounced after the mail server accepted it. Nothing inside the engine can
+trigger on those. `scheduler.py` detects whether your host uses cron, systemd timers or Windows
+Task Scheduler and installs six jobs; on a host with none of them, `scheduler.py --run-forever`
+*is* the clock. `--dry-run` is the default, installing twice is safe, and it ships in `test` mode
+so your first week cannot reach a vendor. Details: [`references/scheduler.md`](references/scheduler.md).
 
 You will need: a Multica account and API token, a Google OAuth **Desktop** client of your own, and
 optionally an LLM API key (without one, classification degrades to a keyword matcher rather than
@@ -64,9 +74,9 @@ to fix it, rather than mailing as somebody else. That is deliberate.
 
 ## Honest limits
 
-- The automated half (deadline watching, auto-sending) needs a machine that stays awake. Run only
-  in a chat session, you get the drafting and case-management half.
-- Scheduling is not included — the reference deployment's cron wrappers are specific to its host.
+- The automated half (deadline watching, auto-sending) needs a machine that stays awake. `scheduler.py`
+  installs the clock, but it cannot run jobs on a laptop that is asleep. Run only in a chat session,
+  you get the drafting and case-management half.
 - Confirming that a refund actually landed relies on a bank/issuer email or a line you write
   yourself. There is no bank API.
 - A case whose remedy is a replacement or repair rather than money has no automated close path yet.

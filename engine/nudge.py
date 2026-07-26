@@ -17,6 +17,10 @@ the vendor recipient) cannot be resolved from the record, the nudge is LISTED bu
 The follow-up body is the Day-3 nudge from the skill's letter-templates (§2 "Retention ask",
 Lane 🟡 — the days-3-7 status-request pivot), reduced to only the tokens we can ground.
 
+Gates (M44): a case parked on `MR Awaiting User YES` is never nudged, and a CLIENT case is
+never nudged at all — a nudge is an outbound to a third party sent on somebody else's behalf,
+which needs that client's written authorization. An elapsed deadline is not consent.
+
 Modes:
   (default)   dry-run — list every due nudge (subject + body + recipient). Writes NOTHING.
   --enqueue   enqueue each due nudge via send_queue with a 0-hour window. Sending itself is still
@@ -39,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/data/scripts")
 import multica_api as mc      # noqa: E402
 import send_queue             # noqa: E402
+import remedy_map             # noqa: E402  — PHASE_LEVER: which court-gate lever a send satisfies
 import idempotency            # noqa: E402
 import mer_config             # noqa: E402  (M32 — identity comes from the profile, not a literal)
 import case_queries           # noqa: E402  (M33 — the shared description-block parser)
@@ -68,6 +73,32 @@ _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # consumer (inbox_watcher) can use it without transitively importing this module's send path.
 _block = case_queries._block
 parse_vendor = case_queries.parse_vendor
+
+
+# ---------------------------------------------------------------- client-case gate (M44)
+# Detection is the shared CONVENTION, not a copy of a roster: `CLIENT:` title prefix, a
+# `CLIENT CASE` description marker, or any board property whose NAME mentions "client" with an
+# affirmative value. case_tick owns the canonical implementation; it is imported LAZILY so this
+# module keeps its dependency direction (nudge is a consumer, and case_tick imports nudge back
+# inside main()). If the import is unavailable the two convention checks are done inline — the
+# gate must never silently become a no-op because of an import error.
+_CLIENT_AFFIRMATIVE = {"yes", "true", "y", "1", "client", "client case", "on", "checked", "✓"}
+
+
+def _is_client_case(issue):
+    try:
+        import case_tick
+        return case_tick.is_client_case(issue)
+    except Exception:
+        issue = issue or {}
+        if (issue.get("title") or "").strip().upper().startswith("CLIENT:"):
+            return True
+        if (issue.get("description") or "").lstrip().upper().startswith("CLIENT CASE"):
+            return True
+        for name, val in (issue.get("mr") or {}).items():
+            if "client" in str(name).lower() and str(val).strip().lower() in _CLIENT_AFFIRMATIVE:
+                return True
+        return False
 
 
 def _tier_num(phase):
@@ -189,6 +220,14 @@ def due_nudges(today=None):
         # not a gate.
         if str(p.get("MR Awaiting User YES", "")).lower() in ("true", "1", "yes", "✓"):
             continue
+        # GATE — a CLIENT case is never auto-nudged. A nudge is an outbound to a third party
+        # sent on somebody else's behalf, and that needs the client's WRITTEN authorization;
+        # a deadline elapsing is not consent. Same CONVENTION the rest of the engine uses
+        # (case_tick.is_client_case / mer_engine.is_client_case), and the same one-way
+        # fail-safe: any single signal is enough. The case is simply skipped — a human writes
+        # the client's follow-up, which is what the workflow already required.
+        if _is_client_case(it):
+            continue
         phase = p.get("MR Phase")
         if phase not in NUDGE_PHASES:
             continue
@@ -228,8 +267,14 @@ def enqueue_due(today=None, verbose=False):
     for n in due_nudges(today):
         if not n["ready"] or _already_handled(n["case"], n["action"], n["to"], n["body"]):
             continue
+        # lever: the send_queue marks this lever ATTEMPTED only after the transport confirms the
+        # letter actually went — not here, because a queued letter can still be vetoed, and a
+        # vetoed letter marked attempted would open the court gate on a lever nobody pulled.
+        # Tier3 is deliberately absent from PHASE_LEVER (four separate portal filings — only the
+        # person who filed knows which), so it stays None and is logged by hand via the CLI.
         rid = send_queue.enqueue(n["case"], n["to"], n["subject"], n["body"],
-                                 action=n["action"], window_hours=0)
+                                 action=n["action"], window_hours=0,
+                                 lever=remedy_map.PHASE_LEVER.get(n.get("phase")))
         n["queue_id"] = rid
         enqueued.append(n)
         if verbose:
@@ -270,8 +315,14 @@ def main():
         if _already_handled(n["case"], n["action"], n["to"], n["body"]):
             print("   -> SKIP: this nudge was already enqueued/sent (idempotent).\n")
             continue
+        # lever: the send_queue marks this lever ATTEMPTED only after the transport confirms the
+        # letter actually went — not here, because a queued letter can still be vetoed, and a
+        # vetoed letter marked attempted would open the court gate on a lever nobody pulled.
+        # Tier3 is deliberately absent from PHASE_LEVER (four separate portal filings — only the
+        # person who filed knows which), so it stays None and is logged by hand via the CLI.
         rid = send_queue.enqueue(n["case"], n["to"], n["subject"], n["body"],
-                                 action=n["action"], window_hours=0)
+                                 action=n["action"], window_hours=0,
+                                 lever=remedy_map.PHASE_LEVER.get(n.get("phase")))
         print("   -> ENQUEUED id=%s (window 0; sends per MER_ENGINE_SEND at process time)\n" % rid)
 
 
@@ -398,6 +449,29 @@ def _selftest():
         check("status=%s -> no nudge" % st, n == [], "%d" % len(n))
     n = only(_issue("MER-C", deadline="2026-07-27", project_id=BUILD_PROJECT))
     check("engine-build project is never nudged", n == [], "%d" % len(n))
+
+    # 3b. M44 — a CLIENT case is never auto-nudged, by any of the three convention signals.
+    #     A nudge is an outbound to a third party on somebody else's behalf: it needs the
+    #     client's written authorization, and an elapsed deadline is not consent.
+    base = _issue("MER-CL", deadline="2026-07-27")
+    cl_title = dict(base, title="CLIENT: Jordan Rivera - a cordless drill via Acme Tools")
+    check("CLIENT:-titled case yields NO nudge", only(cl_title) == [],
+          "%d" % len(only(cl_title)))
+    cl_desc = dict(base, description="CLIENT CASE. " + base["description"])
+    check("'CLIENT CASE' description marker yields NO nudge", only(cl_desc) == [],
+          "%d" % len(only(cl_desc)))
+    cl_prop = dict(base, mr=dict(base["mr"], **{"MR Client Case": "yes"}))
+    check("affirmative MR Client Case property yields NO nudge", only(cl_prop) == [],
+          "%d" % len(only(cl_prop)))
+    check("the same case WITHOUT a client signal still nudges", len(only(base)) == 1)
+    # ...and nothing can be enqueued for one either.
+    send_queue._save([])
+    if os.path.exists(idempotency.LEDGER):
+        os.remove(idempotency.LEDGER)
+    board[:] = [cl_title]
+    got = enqueue_due(TODAY)
+    check("a client case enqueues NOTHING", got == [] and send_queue._load() == [],
+          "%d enqueued" % len(got))
 
     # 4. an ungrounded recipient is ready=False and is NEVER auto-sent/enqueued.
     bare = "VENDOR/ITEM: Acme Tools — a cordless drill.\n"

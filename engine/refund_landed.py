@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""refund_landed.py — M28 refund-landed verification before CLOSE.
+"""refund_landed.py — M28/M44 remedy-landed verification before CLOSE.
+
+M44 SUMMARY (read this first)
+-----------------------------
+This file began as a MONEY check and is now the landing check for every remedy the ladder
+can win. The public surface:
+
+    refund_landed(case, amount, since, ...)     # money — unchanged, still the M28 contract
+    remedy_landed(case, since, remedy_type=..., amount=..., tokens=...)   # any remedy
+    close_gate(case, amount, since, verdict, remedy_type=..., tokens=...) # the CLOSE gate
+
+    refund       money posted, per a bank/issuer notice or the human-confirm log
+    replacement  parcel DELIVERED per the CARRIER, matched to a tracking/RMA identifier
+    repair       human confirmation ONLY — the unit is back AND verified working
+    store_credit the amount named AND a real credit code/card/certificate handed over
+
+The remedy type is read from `MR Remedy Type` on the issue (onboard.MR_SCHEMA). It is never
+inferred from prose and never defaulted: absent or ambiguous means the gate cannot run, and
+a gate that cannot run holds the case open. The rest of this docstring describes the money
+path, which is unchanged.
 
 WHY THIS EXISTS
 ---------------
@@ -77,8 +96,16 @@ DEFAULT_CONFIRM_FILE = "/opt/data/refund_confirmations.json"
 
 
 def _human_confirm_howto(confirm_file=DEFAULT_CONFIRM_FILE):
-    """The manual-confirm instructions, addressed to whoever owns the profile (M32)."""
-    who = mer_config.legal_name()
+    """The manual-confirm instructions, addressed to whoever owns the profile (M32).
+
+    Degrades rather than raising: this text is printed on the HOLD path, and a case that is
+    already being held must not turn into a traceback because no profile is configured. The
+    instructions are still correct without a name.
+    """
+    try:
+        who = mer_config.legal_name()
+    except Exception:
+        who = "the profile owner"
     return """\
 Manual human-confirm step (when the bank does not email a credit notice):
   %s verifies the refund posted in their account, then appends an entry to
@@ -93,8 +120,25 @@ Manual human-confirm step (when the bank does not email a credit notice):
 
   Keyed by case identifier. Any amount whose 'date' is on/after the resolution
   date counts as landed=True at HIGH confidence. This is the intended fallback and
-  is a deliberate human action — no agent may write this file on its own.""" % (
-        who, confirm_file, who, who)
+  is a deliberate human action — no agent may write this file on its own.
+
+Non-money remedies (M44) use the SAME file with an explicit kind + confirmed flag:
+
+    {
+      "CASE-2": [
+        {"kind": "replacement", "date": "2026-08-02", "confirmed": true,
+         "token": "1Z999AA10123456784", "note": "box arrived, right model", "by": "%s"},
+        {"kind": "repair",      "date": "2026-08-09", "confirmed": true,
+         "token": "RMA-88213", "note": "unit back and powers on, tested 20 min", "by": "%s"}
+      ]
+    }
+
+  "confirmed": true is the attestation and is never inferred. For a REPLACEMENT it means
+  the item is in %s's hands; for a REPAIR it means the unit is back AND was verified
+  working; for STORE CREDIT it means the balance is visible and usable. A repair has no
+  other accepted proof at all — a carrier can say the box came back, but only its owner
+  can say it works.""" % (
+        who, confirm_file, who, who, who, who, who)
 
 # A credit noun — money coming BACK to the customer (not a charge going out).
 CREDIT_NOUN = re.compile(
@@ -339,6 +383,454 @@ def _confidence_for_sender(frm):
     return "medium" if any(h in low for h in FINANCIAL_HINTS) else "low"
 
 
+# =========================================================================================
+# M44 — EVERY REMEDY, NOT JUST MONEY
+# =========================================================================================
+# Until M44 this module could only reason about a refund. A case whose remedy was a
+# REPLACEMENT, a REPAIR or STORE CREDIT had no automated close path at all: close_case
+# demanded an amount, no amount existed, and the case failed closed forever. Safe, but it
+# meant three of the four remedies the ladder can win were invisible to the engine.
+#
+# The generalization keeps the same shape of proof it always demanded for money:
+#   * a THIRD PARTY, not the vendor being pursued, says the thing actually arrived; or
+#   * the person themselves logs that they have it, in the human-confirm file.
+# The vendor's own word is never sufficient for any remedy — that is the whole thesis of
+# this file, and it does not weaken because the remedy stopped being cash.
+#
+# THE BOARD PROPERTY
+# ------------------
+# The remedy type is read from `MR Remedy Type` on the issue — a select added to
+# onboard.MR_SCHEMA in M44 (Refund / Replacement / Repair / StoreCredit). It is NOT
+# inferred from prose, and it is NOT defaulted: an absent or unreadable value means the
+# gate cannot run, and a gate that cannot run holds the case open.
+#
+# WHY IT IS SET AT RESOLUTION, NOT AT INTAKE
+# ------------------------------------------
+# Intake question 5.1 asks for a RANKED list ("refund / replacement / repair / credit").
+# A ranked list names several families and is therefore ambiguous — normalize_remedy()
+# deliberately returns None for it. The remedy that decides how a case CLOSES is the one
+# the vendor actually granted, which is known at resolution time. new_case.py seeds the
+# property only when the intake names exactly one family; otherwise it is left blank and
+# set when the grant arrives.
+REMEDY_TYPE_PROP = "MR Remedy Type"
+REMEDY_TYPES = ("refund", "replacement", "repair", "store_credit")
+# Remedies denominated in money — these carry an amount and use the original M28 logic.
+MONEY_REMEDIES = ("refund", "store_credit")
+
+_REMEDY_FAMILY_WORDS = {
+    "refund": ("refund", "refunded", "reimburse", "reimbursement", "money back",
+               "chargeback", "credit back", "trace"),
+    "replacement": ("replacement", "replace", "exchange", "reship", "new unit",
+                    "send another", "swap"),
+    "repair": ("repair", "repaired", "fix", "fixed", "service", "servicing"),
+    "store_credit": ("store credit", "storecredit", "gift card", "giftcard",
+                     "gift certificate", "voucher", "account credit",
+                     "merchandise credit", "e gift", "egift"),
+}
+
+# Senders that are INDEPENDENT of the vendor for a shipment: the carrier. The carrier is to
+# a replacement what the bank is to a refund — a third party with no stake in the dispute
+# saying the thing physically arrived.
+CARRIER_HINTS = (
+    "ups.com", "fedex", "usps", "dhl", "ontrac", "lasership", "purolator",
+    "canadapost", "auspost", "royalmail", "shipment-tracking", "tracking@",
+    "shipping@", "no-reply@", "noreply@", "notification",
+)
+
+# A parcel actually ARRIVED. "Shipped" is not "delivered" — see SHIPPING_FUTURE.
+DELIVERED_VERB = re.compile(
+    r"delivered|left at|handed to|signed for|front door|front desk|"
+    r"picked up at|available for pickup|received at", re.I)
+
+# Everything that means the parcel is still MOVING. Its presence blocks a landing exactly
+# the way "will be credited" blocks a refund: a promise about the future, not an arrival.
+SHIPPING_FUTURE = re.compile(
+    r"label (?:created|printed)|pre-?shipment|shipment created|in transit|"
+    r"out for delivery|on (?:its|the) way|has shipped|have shipped|is shipping|"
+    r"dispatched|expected|estimated|scheduled|will (?:arrive|ship|be delivered)|"
+    r"tracking (?:number|info)", re.I)
+
+# The nouns that name each remedy's deliverable inside a message.
+REMEDY_NOUN = {
+    "replacement": re.compile(
+        r"replacement|new unit|exchange|your (?:package|parcel|shipment|order)|"
+        r"shipment|parcel|package", re.I),
+    "repair": re.compile(
+        r"repair|repaired|serviced|service order|work order|\brma\b", re.I),
+    "store_credit": re.compile(
+        r"store credit|gift card|gift certificate|merchandise credit|account credit|"
+        r"voucher|e-?gift|credit balance", re.I),
+}
+
+# A repair is "landed" only when the unit is back AND WORKS. No email can attest the second
+# half, which is why REQUIRES_HUMAN below names repair and nothing else.
+REPAIR_DONE_VERB = re.compile(
+    r"repair (?:is |has been |was )?(?:complete|completed|finished)|"
+    r"completed the repair|repaired and (?:returned|shipped)|"
+    r"returned to you|delivered back|passed (?:testing|inspection)", re.I)
+
+STORE_CREDIT_VERB = re.compile(
+    r"issued|applied to your|added to your|credited to your|is (?:now )?available|"
+    r"has been added|now shows|reflects", re.I)
+
+# A store credit's deliverable is an ARTIFACT — a code, a card number, a certificate id.
+# A message that names one is handing over the thing itself; a message that only promises
+# one ("a credit will be issued") is the same promise this module has always rejected.
+CREDIT_ARTIFACT = re.compile(
+    r"(?:code|certificate|voucher|card|credit)\s*(?:#|no\.?|number|id)?\s*[:\-]?\s*"
+    r"([A-Z0-9][A-Z0-9-]{5,})")
+
+# Remedies no email can ever settle, because the decisive fact is physical and private to
+# the owner. For these, ONLY a human confirmation establishes landing.
+REQUIRES_HUMAN = ("repair",)
+
+
+def normalize_remedy(value):
+    """A remedy string from the board (or a CLI flag) -> one of REMEDY_TYPES, or None.
+
+    None is returned for anything blank, unrecognised, OR AMBIGUOUS. Ambiguity is the
+    common case and the important one: intake 5.1 collects a RANKED preference list
+    ("refund / replacement / repair / credit"), which names several families at once. A
+    guess between them would decide how a case closes, so it is refused — the caller gets
+    None and the gate holds.
+    """
+    if value is None:
+        return None
+    s = re.sub(r"[\s_/|,;-]+", " ", str(value).strip().lower())
+    if not s:
+        return None
+    direct = s.replace(" ", "_")
+    if direct in REMEDY_TYPES:
+        return direct
+    hits = set()
+    for fam, words in _REMEDY_FAMILY_WORDS.items():
+        for w in words:
+            if re.search(r"(?<![a-z])%s(?![a-z])" % re.escape(w), s):
+                hits.add(fam)
+                break
+    return hits.pop() if len(hits) == 1 else None
+
+
+def remedy_type_from_case(case):
+    """Read the remedy type off the case's REAL board data. Never invents one.
+
+    Looks at `case["mr"]["MR Remedy Type"]` first (the property multica_api resolves by
+    name), then a top-level `remedy_type` / `remedy` key so a plain dict from a CLI or a
+    test can carry it. Returns None when the property is absent, blank or ambiguous —
+    which every caller must treat as "cannot check", not as "refund".
+    """
+    if not isinstance(case, dict):
+        return None
+    sources = []
+    if isinstance(case.get("mr"), dict):
+        sources.append(case["mr"])
+    sources.append(case)
+    for src in sources:
+        for key in (REMEDY_TYPE_PROP, "remedy_type", "remedy"):
+            if key in src:
+                t = normalize_remedy(src.get(key))
+                if t:
+                    return t
+    return None
+
+
+def _human_remedy_confirmations(case_ident, remedy_type, since_d, path, anchors=None):
+    """Human confirmations for a NON-money remedy. Reads `path`; never writes it.
+
+    An entry counts only when ALL of these hold — anything less is not a confirmation:
+        {"kind": "<remedy_type>", "date": "YYYY-MM-DD", "confirmed": true, ...}
+      * kind matches the remedy being checked,
+      * date is on/after the resolution date,
+      * "confirmed" is explicitly true. The flag is the whole point: for a repair it means
+        "the unit is back AND I verified it works", for a replacement "I have it in my
+        hands", for a store credit "I can see the balance and it is usable". A dated entry
+        without it is a note, not an attestation.
+      * if `anchors` are supplied (tracking / RMA / credit code), the entry's own
+        "token"/"note" must mention one of them, so a confirmation cannot be recycled from
+        a different shipment on the same case.
+    """
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (IOError, ValueError):
+        return []
+    entries = data.get(case_ident) or data.get(str(case_ident)) or []
+    anchors = [str(a).strip().lower() for a in (anchors or []) if str(a).strip()]
+    out = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        kind = normalize_remedy(e.get("kind") or e.get("remedy") or e.get("remedy_type"))
+        if kind != remedy_type:
+            continue
+        if e.get("confirmed") is not True:
+            continue
+        try:
+            ed = _to_date(e.get("date"))
+        except Exception:
+            continue
+        if ed < since_d:
+            continue
+        if anchors:
+            hay = ("%s %s" % (e.get("token", ""), e.get("note", ""))).lower()
+            if not any(a in hay for a in anchors):
+                continue
+        out.append({
+            "source": "human-confirm", "remedy": remedy_type, "date": e.get("date"),
+            "note": e.get("note", ""), "by": e.get("by", "human"),
+            "token": e.get("token", ""),
+        })
+    return out
+
+
+def _remedy_evidence_in_text(remedy_type, text, anchors, window=160):
+    """(confirmed, snippet) for a non-money remedy in one message body.
+
+    Same three-part test the money path uses, transposed:
+      (a) the deliverable is NAMED (REMEDY_NOUN),
+      (b) an affirmative ARRIVAL/COMPLETION verb is present,
+      (c) no negation / not-yet / still-in-transit language sits in the same window.
+    When anchors (tracking number, RMA, credit code) are supplied the match must sit near
+    one of them, so an unrelated parcel on the same thread cannot close the case.
+    """
+    if not text:
+        return False, None
+    noun = REMEDY_NOUN.get(remedy_type)
+    if noun is None:
+        return False, None
+    if remedy_type == "replacement":
+        verb, extra_block = DELIVERED_VERB, SHIPPING_FUTURE
+    elif remedy_type == "repair":
+        verb, extra_block = REPAIR_DONE_VERB, SHIPPING_FUTURE
+    elif remedy_type == "store_credit":
+        verb, extra_block = STORE_CREDIT_VERB, None
+    else:
+        return False, None
+
+    spans = []
+    if anchors:
+        low = text.lower()
+        for a in anchors:
+            a = str(a).strip().lower()
+            if not a:
+                continue
+            i = low.find(a)
+            while i != -1:
+                spans.append((i, i + len(a)))
+                i = low.find(a, i + 1)
+        if not spans:
+            return False, None
+    else:
+        spans = [(m.start(), m.end()) for m in verb.finditer(text)]
+
+    for start, end in spans:
+        lo = max(0, start - window)
+        hi = min(len(text), end + window)
+        ctx = text[lo:hi]
+        if not noun.search(ctx) or not verb.search(ctx):
+            continue
+        if NEGATION_OR_FUTURE.search(ctx):
+            continue
+        if extra_block is not None and extra_block.search(ctx):
+            continue
+        return True, re.sub(r"\s+", " ", ctx).strip()
+    return False, None
+
+
+def _remedy_sender_confidence(remedy_type, frm):
+    """How much a sender is worth for THIS remedy.
+
+    replacement -> the CARRIER is the independent witness (the bank's analogue).
+    repair      -> nothing an email says can prove the unit works; email is never enough.
+    store_credit-> the vendor IS the ledger, so there is no independent third party at all;
+                   see _store_credit_ok for what has to make up the difference.
+    """
+    low = (frm or "").lower()
+    if remedy_type == "replacement":
+        return "medium" if any(h in low for h in CARRIER_HINTS) else "low"
+    if remedy_type == "store_credit":
+        return "medium"
+    return "low"
+
+
+def _non_money_landed(case, remedy_type, since, *, tokens=None, token=None,
+                      human_confirm_file=DEFAULT_CONFIRM_FILE, gmail_search=None):
+    """Landing check for replacement / repair / store_credit. Fails closed everywhere."""
+    since_d = _to_date(since)
+    query, ident = _case_query(case)
+    anchors = [str(t).strip() for t in (tokens or []) if str(t).strip()]
+    evidence = []
+
+    # 1) Human confirmation — always sufficient, and for a repair the ONLY thing that is.
+    human = _human_remedy_confirmations(ident, remedy_type, since_d, human_confirm_file,
+                                        anchors)
+    if human:
+        evidence.extend(human)
+        return {"landed": True, "confidence": "high", "evidence": evidence,
+                "remedy_type": remedy_type, "anchors": anchors,
+                "since": since_d.isoformat(), "case": ident, "amounts": []}
+
+    if remedy_type in REQUIRES_HUMAN:
+        evidence.append({
+            "source": "gap",
+            "detail": ("a %s can only be confirmed by the owner: the unit has to be BACK "
+                       "and verified WORKING, and no email can attest the second half. "
+                       "No human confirmation on/after %s — holding."
+                       % (remedy_type, since_d.isoformat())),
+            "missing": [remedy_type]})
+        return {"landed": False, "confidence": "none", "evidence": evidence,
+                "remedy_type": remedy_type, "anchors": anchors,
+                "since": since_d.isoformat(), "case": ident, "amounts": []}
+
+    if not anchors:
+        # No tracking number, RMA or credit code to match on. A search with no anchor would
+        # match any parcel on the thread — a gate that matches anything is not a gate.
+        evidence.append({
+            "source": "gap",
+            "detail": ("cannot check: no tracking / RMA / credit identifier supplied for a "
+                       "%s, so there is nothing to tie an arrival to THIS remedy"
+                       % remedy_type),
+            "missing": [remedy_type]})
+        return {"landed": False, "confidence": "none", "evidence": evidence,
+                "remedy_type": remedy_type, "anchors": anchors,
+                "since": since_d.isoformat(), "case": ident, "amounts": []}
+
+    # 2) Third-party email confirmation.
+    search = gmail_search or _default_remedy_search
+    try:
+        msgs = search(query, since_d, anchors, token=token) or []
+    except TypeError:
+        msgs = search(query, since_d, anchors) or []
+    except Exception as exc:
+        evidence.append({"source": "gmail-error", "detail": str(exc)[:180]})
+        msgs = []
+
+    for msg in msgs:
+        raw = _strip_quotes(msg.get("body") or "")
+        body = raw + "\n" + (msg.get("subject") or "")
+        ok, snippet = _remedy_evidence_in_text(remedy_type, body, anchors)
+        if not ok:
+            continue
+        conf = _remedy_sender_confidence(remedy_type, msg.get("from", ""))
+        base = {"remedy": remedy_type, "from": msg.get("from", ""),
+                "subject": (msg.get("subject") or "")[:120], "date": msg.get("date", ""),
+                "gmail_id": msg.get("id", ""), "snippet": (snippet or "")[:220]}
+        if remedy_type == "store_credit" and not CREDIT_ARTIFACT.search(body):
+            # The vendor is the issuer, so its word is all there will ever be. A credit
+            # CODE is the deliverable itself; without one this is still just a promise.
+            evidence.append(dict(base, source="email-weak", confidence="low",
+                                 note="store-credit claim with no credit code / card / "
+                                      "certificate identifier — an issuance promise, not "
+                                      "the credit itself"))
+            continue
+        if conf != "medium":
+            evidence.append(dict(base, source="email-weak", confidence="low",
+                                 note="not an independent third party (carrier/issuer) — "
+                                      "the vendor being pursued cannot confirm its own "
+                                      "delivery"))
+            continue
+        evidence.append(dict(base, source="email", confidence="medium"))
+        return {"landed": True, "confidence": "medium", "evidence": evidence,
+                "remedy_type": remedy_type, "anchors": anchors,
+                "since": since_d.isoformat(), "case": ident, "amounts": []}
+
+    evidence.append({
+        "source": "gap",
+        "detail": "no independent confirmation that the %s arrived at/after %s (anchors: %s)"
+                  % (remedy_type, since_d.isoformat(), ", ".join(anchors) or "none"),
+        "missing": [remedy_type]})
+    return {"landed": False, "confidence": "none" if not evidence else "low",
+            "evidence": evidence, "remedy_type": remedy_type, "anchors": anchors,
+            "since": since_d.isoformat(), "case": ident, "amounts": []}
+
+
+def _default_remedy_search(case_query, since_d, anchors, token=None, max_results=15):
+    """Live Gmail search for a non-money remedy: messages after since_d mentioning any
+    supplied tracking / RMA / credit identifier. Same transport as the money search."""
+    import urllib.parse
+    import urllib.request
+    import gmail_fetch
+
+    tok = token or gmail_fetch.access_token()
+    terms = " OR ".join('"%s"' % a for a in anchors)
+    q = "(%s) after:%s" % (terms, since_d.strftime("%Y/%m/%d"))
+    if case_query:
+        q = "(%s) %s" % (case_query, q)
+    url = ("https://gmail.googleapis.com/gmail/v1/users/me/messages?q=%s&maxResults=%d"
+           % (urllib.parse.quote(q), max_results))
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer %s" % tok})
+    ids = (json.loads(urllib.request.urlopen(req, timeout=25).read()).get("messages") or [])
+    out = []
+    for m in ids:
+        try:
+            msg = gmail_fetch.get_message(m["id"], token=tok)
+        except Exception:
+            continue
+        hdrs = {h["name"]: h["value"] for h in (msg.get("payload", {}).get("headers") or [])}
+        out.append({"id": m["id"], "from": hdrs.get("From", ""),
+                    "subject": hdrs.get("Subject", ""), "date": hdrs.get("Date", ""),
+                    "body": _decode_body(msg.get("payload", {}))})
+    return out
+
+
+def remedy_landed(case, since, *, remedy_type=None, amount=None, tokens=None, token=None,
+                  human_confirm_file=DEFAULT_CONFIRM_FILE, gmail_search=None):
+    """Did the remedy this case actually won ACTUALLY land? Any remedy type.
+
+    Returns the same shape refund_landed() returns, plus "remedy_type".
+
+        refund       -> money posted (the original M28 logic, unchanged)
+        store_credit -> a credit for the amount, issued WITH a credit code/card/certificate
+        replacement  -> the parcel DELIVERED per the carrier, matched to a tracking number
+        repair       -> human confirmation only: unit back AND verified working
+
+    FAILS CLOSED on every unknown. No remedy type, an ambiguous one, a money remedy with no
+    amount, a shipped remedy with no tracking identifier — each of these returns
+    landed=False with a `gap`, never a guess.
+    """
+    rt = normalize_remedy(remedy_type) or remedy_type_from_case(case)
+    _, ident = _case_query(case)
+    if rt is None:
+        return {"landed": False, "confidence": "none", "case": ident, "amounts": [],
+                "remedy_type": None, "since": _to_date(since).isoformat(),
+                "evidence": [{"source": "gap",
+                              "detail": ("cannot check: no unambiguous remedy type. Set `%s` "
+                                         "on the issue to one of %s. An absent or ranked "
+                                         "value is not guessed — the case stays open."
+                                         % (REMEDY_TYPE_PROP, "/".join(REMEDY_TYPES))),
+                              "missing": [REMEDY_TYPE_PROP]}]}
+    if rt in MONEY_REMEDIES:
+        if not amount or (isinstance(amount, (list, tuple)) and not list(amount)):
+            return {"landed": False, "confidence": "none", "case": ident, "amounts": [],
+                    "remedy_type": rt, "since": _to_date(since).isoformat(),
+                    "evidence": [{"source": "gap",
+                                  "detail": "cannot check: %s is a money remedy and no "
+                                            "amount was supplied" % rt,
+                                  "missing": ["amount"]}]}
+        if rt == "refund":
+            r = refund_landed(case, amount, since, token=token,
+                              human_confirm_file=human_confirm_file,
+                              gmail_search=gmail_search)
+            r["remedy_type"] = "refund"
+            return r
+        # store_credit: the amount must be named AND a credit artifact handed over.
+        r = _non_money_landed(case, "store_credit", since, tokens=(tokens or []) or
+                              ["$%.2f" % a for a in
+                               [_norm_amount(x) for x in
+                                (amount if isinstance(amount, (list, tuple, set))
+                                 else [amount])] if a is not None],
+                              token=token, human_confirm_file=human_confirm_file,
+                              gmail_search=gmail_search)
+        r["amounts"] = ["$%.2f" % a for a in
+                        [_norm_amount(x) for x in
+                         (amount if isinstance(amount, (list, tuple, set)) else [amount])]
+                        if a is not None]
+        return r
+    return _non_money_landed(case, rt, since, tokens=tokens, token=token,
+                             human_confirm_file=human_confirm_file,
+                             gmail_search=gmail_search)
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -445,14 +937,22 @@ def refund_landed(case, amount, since, *, token=None,
 # --------------------------------------------------------------------------- #
 # CLOSE gate — REPORT-ONLY hook (not wired into case_tick.py by this module)
 # --------------------------------------------------------------------------- #
-def close_gate(case, amount, since, resolution_verdict, **kw):
+def close_gate(case, amount, since, resolution_verdict, *, remedy_type=None, tokens=None,
+               **kw):
     """The gate that guards the move to CLOSE. Two independent conditions BOTH
     required:
 
         (A) M19 says the reply granted the remedy   -> resolution_verdict["resolved"]
-        (B) M28 says the money actually landed       -> refund_landed(...)["landed"]
+        (B) M28/M44 says the remedy actually landed  -> remedy_landed(...)["landed"]
 
     A case may CLOSE only when A AND B. A vendor's promise (A alone) is NOT enough.
+
+    M44: (B) now covers every remedy the ladder can win, not only money. The remedy type
+    comes from `MR Remedy Type` on the issue (or an explicit remedy_type=). When the
+    property is absent the gate falls back to the money path ONLY if an amount was
+    explicitly supplied — that is the historical M28 contract and the strictest of the four
+    checks, so the fallback cannot loosen anything. With neither a remedy type nor an
+    amount, the gate holds.
 
     Returns {"may_close": bool, "reason": str, "refund": <refund_landed dict>}.
 
@@ -483,19 +983,23 @@ def close_gate(case, amount, since, resolution_verdict, **kw):
                                  --since 2026-06-13 --resolved
         exit 0 -> CLOSE permitted     exit 2 -> HOLD (do not close)
     """
-    r = refund_landed(case, amount, since, **kw)
+    rt = normalize_remedy(remedy_type) or remedy_type_from_case(case)
+    if rt is None and amount:
+        rt = "refund"          # historical M28 contract; the strictest of the four checks
+    r = remedy_landed(case, since, remedy_type=rt, amount=amount, tokens=tokens, **kw)
     resolved = bool((resolution_verdict or {}).get("resolved"))
     may_close = resolved and r["landed"]
     if may_close:
-        reason = ("CLOSE permitted: remedy granted (M19) AND refund landed (M28, "
-                  "confidence=%s)." % r["confidence"])
+        reason = ("CLOSE permitted: remedy granted (M19) AND %s landed (M28/M44, "
+                  "confidence=%s)." % (r.get("remedy_type") or "remedy", r["confidence"]))
     elif not resolved:
         reason = "HOLD: M19 says the remedy was not actually granted."
     else:
-        reason = ("HOLD: M19 granted but M28 has NO landed confirmation — %s. "
-                  "A promise is not a posted refund." %
-                  next((e.get("detail") for e in r["evidence"]
-                        if e.get("source") == "gap"), "money not confirmed"))
+        reason = ("HOLD: M19 granted but there is NO landed confirmation for the %s — %s. "
+                  "A promise is not a delivered remedy." %
+                  (r.get("remedy_type") or "remedy",
+                   next((e.get("detail") for e in r["evidence"]
+                         if e.get("source") == "gap"), "remedy not confirmed")))
     return {"may_close": may_close, "reason": reason, "refund": r}
 
 
@@ -617,6 +1121,160 @@ def _selftests():
     cases.append(("close_gate: granted AND landed -> may_close True",
                   g["may_close"] is True, g))
 
+    # ---------------------------------------------------------------------------------
+    # M44 — the other three remedies. Same thesis, non-money proof.
+    # ---------------------------------------------------------------------------------
+    import tempfile as _tf
+
+    def _hc(payload):
+        p = os.path.join(_tf.gettempdir(), "rl_m44_confirm.json")
+        with open(p, "w") as fh:
+            json.dump(payload, fh)
+        return p
+
+    # 7) remedy type must be UNAMBIGUOUS. A ranked intake answer is not a decision.
+    cases.append(("ranked intake answer is ambiguous -> no remedy type",
+                  normalize_remedy("refund / replacement / repair / credit (ranked)") is None,
+                  {"normalize": None}))
+    cases.append(("'StoreCredit' select option normalizes",
+                  normalize_remedy("StoreCredit") == "store_credit", {}))
+    cases.append(("'Exchange' reads as a replacement",
+                  normalize_remedy("Exchange") == "replacement", {}))
+    cases.append(("remedy type is read off the board property",
+                  remedy_type_from_case({"mr": {REMEDY_TYPE_PROP: "Repair"}}) == "repair", {}))
+
+    # 8) No remedy type at all -> cannot check -> NOT landed.
+    r = remedy_landed({"identifier": "TEST-8", "query": "x"}, "2026-07-20",
+                      gmail_search=_fake_search([]))
+    cases.append(("no MR Remedy Type -> NOT landed (fails closed)",
+                  r["landed"] is False and r["remedy_type"] is None, r))
+
+    # 9) REPLACEMENT: the carrier says DELIVERED, matched to the tracking number -> landed.
+    delivered = [{
+        "id": "m44a", "from": "auto-notify@ups.com", "subject": "Your package was delivered",
+        "date": "Sun, 03 Aug 2026 14:02:00 -0500",
+        "body": "Your replacement shipment 1Z999AA10123456784 was delivered and left at "
+                "the front door.",
+    }]
+    r = remedy_landed({"identifier": "TEST-9", "query": "x",
+                       "mr": {REMEDY_TYPE_PROP: "Replacement"}}, "2026-07-20",
+                      tokens=["1Z999AA10123456784"], gmail_search=_fake_search(delivered))
+    cases.append(("replacement delivered by carrier -> landed (medium)",
+                  r["landed"] is True and r["confidence"] == "medium", r))
+
+    # 9b) 'has shipped' is NOT 'delivered'.
+    shipped = [{
+        "id": "m44b", "from": "auto-notify@ups.com", "subject": "Shipment created",
+        "date": "Fri, 01 Aug 2026 09:00:00 -0500",
+        "body": "Your replacement 1Z999AA10123456784 has shipped and is in transit; "
+                "estimated delivery Monday.",
+    }]
+    r = remedy_landed({"identifier": "TEST-9b", "mr": {REMEDY_TYPE_PROP: "Replacement"}},
+                      "2026-07-20", tokens=["1Z999AA10123456784"],
+                      gmail_search=_fake_search(shipped))
+    cases.append(("replacement only SHIPPED -> NOT landed", r["landed"] is False, r))
+
+    # 9c) The VENDOR saying it delivered is not proof — same trap as the money path.
+    vendor_deliv = [{
+        "id": "m44c", "from": "support@vendorbeingpursued.example",
+        "subject": "Re: replacement", "date": "Sun, 03 Aug 2026 14:02:00 -0500",
+        "body": "Our system shows the replacement 1Z999AA10123456784 was delivered to you.",
+    }]
+    r = remedy_landed({"identifier": "TEST-9c", "mr": {REMEDY_TYPE_PROP: "Replacement"}},
+                      "2026-07-20", tokens=["1Z999AA10123456784"],
+                      gmail_search=_fake_search(vendor_deliv))
+    cases.append(("vendor claims delivery -> NOT landed", r["landed"] is False, r))
+
+    # 9d) No tracking identifier -> nothing ties an arrival to this remedy -> hold.
+    r = remedy_landed({"identifier": "TEST-9d", "mr": {REMEDY_TYPE_PROP: "Replacement"}},
+                      "2026-07-20", gmail_search=_fake_search(delivered))
+    cases.append(("replacement with no tracking anchor -> NOT landed",
+                  r["landed"] is False, r))
+
+    # 9e) Human confirmation closes a replacement at HIGH confidence.
+    p = _hc({"TEST-9e": [{"kind": "replacement", "date": "2026-08-03", "confirmed": True,
+                          "token": "1Z999AA10123456784", "note": "in my hands"}]})
+    r = remedy_landed({"identifier": "TEST-9e", "mr": {REMEDY_TYPE_PROP: "Replacement"}},
+                      "2026-07-20", tokens=["1Z999AA10123456784"],
+                      human_confirm_file=p, gmail_search=_fake_search([]))
+    cases.append(("replacement human-confirm -> landed (high)",
+                  r["landed"] is True and r["confidence"] == "high", r))
+
+    # 10) REPAIR: even a carrier delivering the unit back does NOT close it.
+    back = [{
+        "id": "m44d", "from": "auto-notify@fedex.com", "subject": "Delivered",
+        "date": "Sun, 09 Aug 2026 11:00:00 -0500",
+        "body": "Repair RMA-88213 was delivered and signed for.",
+    }]
+    r = remedy_landed({"identifier": "TEST-10", "mr": {REMEDY_TYPE_PROP: "Repair"}},
+                      "2026-07-20", tokens=["RMA-88213"], gmail_search=_fake_search(back))
+    cases.append(("repair unit delivered back but unverified -> NOT landed",
+                  r["landed"] is False, r))
+
+    # 10b) ... and the owner's confirmation that it WORKS does.
+    p = _hc({"TEST-10b": [{"kind": "repair", "date": "2026-08-09", "confirmed": True,
+                           "token": "RMA-88213", "note": "powers on, tested 20 min"}]})
+    r = remedy_landed({"identifier": "TEST-10b", "mr": {REMEDY_TYPE_PROP: "Repair"}},
+                      "2026-07-20", tokens=["RMA-88213"], human_confirm_file=p,
+                      gmail_search=_fake_search(back))
+    cases.append(("repair confirmed working by owner -> landed (high)",
+                  r["landed"] is True and r["confidence"] == "high", r))
+
+    # 10c) An UNconfirmed human entry is a note, not an attestation.
+    p = _hc({"TEST-10c": [{"kind": "repair", "date": "2026-08-09",
+                           "token": "RMA-88213", "note": "box arrived, not opened yet"}]})
+    r = remedy_landed({"identifier": "TEST-10c", "mr": {REMEDY_TYPE_PROP: "Repair"}},
+                      "2026-07-20", tokens=["RMA-88213"], human_confirm_file=p,
+                      gmail_search=_fake_search([]))
+    cases.append(("human entry without confirmed:true -> NOT landed",
+                  r["landed"] is False, r))
+
+    # 11) STORE CREDIT: an issuance PROMISE with no code is not the credit.
+    promise = [{
+        "id": "m44e", "from": "care@vendorbeingpursued.example", "subject": "Your credit",
+        "date": "Mon, 03 Aug 2026 10:00:00 -0500",
+        "body": "A store credit of $75.00 will be issued to your account shortly.",
+    }]
+    r = remedy_landed({"identifier": "TEST-11", "mr": {REMEDY_TYPE_PROP: "StoreCredit"}},
+                      "2026-07-20", amount=75.00, gmail_search=_fake_search(promise))
+    cases.append(("store credit promised, no code -> NOT landed", r["landed"] is False, r))
+
+    # 11b) A credit with an actual code/certificate IS the deliverable -> landed (medium).
+    issued = [{
+        "id": "m44f", "from": "care@vendorbeingpursued.example", "subject": "Your credit",
+        "date": "Mon, 03 Aug 2026 10:00:00 -0500",
+        "body": "A store credit of $75.00 has been added to your account. "
+                "Gift certificate code: SC-4KQ2-99XB1. It is available now.",
+    }]
+    r = remedy_landed({"identifier": "TEST-11b", "mr": {REMEDY_TYPE_PROP: "StoreCredit"}},
+                      "2026-07-20", amount=75.00, gmail_search=_fake_search(issued))
+    cases.append(("store credit issued WITH a code -> landed (medium)",
+                  r["landed"] is True and r["confidence"] == "medium", r))
+
+    # 11c) A money remedy with no amount cannot be checked.
+    r = remedy_landed({"identifier": "TEST-11c", "mr": {REMEDY_TYPE_PROP: "StoreCredit"}},
+                      "2026-07-20", gmail_search=_fake_search(issued))
+    cases.append(("store credit with no amount -> NOT landed", r["landed"] is False, r))
+
+    # 12) close_gate on a non-money remedy: granted + delivered -> may_close.
+    g = close_gate({"identifier": "TEST-12", "mr": {REMEDY_TYPE_PROP: "Replacement"}},
+                   None, "2026-07-20", {"resolved": True},
+                   tokens=["1Z999AA10123456784"], gmail_search=_fake_search(delivered))
+    cases.append(("close_gate replacement: granted AND delivered -> may_close",
+                  g["may_close"] is True, g))
+
+    # 12b) ... and granted with the parcel still moving -> HOLD.
+    g = close_gate({"identifier": "TEST-12b", "mr": {REMEDY_TYPE_PROP: "Replacement"}},
+                   None, "2026-07-20", {"resolved": True},
+                   tokens=["1Z999AA10123456784"], gmail_search=_fake_search(shipped))
+    cases.append(("close_gate replacement: still in transit -> HOLD",
+                  g["may_close"] is False, g))
+
+    try:
+        os.remove(os.path.join(_tf.gettempdir(), "rl_m44_confirm.json"))
+    except OSError:
+        pass
+
     for name, passed, obj in cases:
         ok = ok and passed
         print("[%s] %s" % ("PASS" if passed else "FAIL", name))
@@ -662,18 +1320,42 @@ def _gate_cli(argv):
     ap = argparse.ArgumentParser(description="M28 CLOSE gate — may this case close?")
     ap.add_argument("--gate", action="store_true")
     ap.add_argument("--case", required=True, help="case identifier, e.g. CASE-1")
-    ap.add_argument("--amount", action="append", required=True,
-                    help="expected amount; repeat for multiple credits (ALL must land)")
+    ap.add_argument("--amount", action="append", default=[],
+                    help="expected amount; repeat for multiple credits (ALL must land). "
+                         "Required for refund / store_credit.")
     ap.add_argument("--since", required=True, help="resolution date, YYYY-MM-DD")
     ap.add_argument("--query", default="", help="optional Gmail scope for this case")
+    ap.add_argument("--remedy-type", default=None,
+                    help="refund | replacement | repair | store_credit. Omit to read `%s` "
+                         "off the board. Never defaulted." % REMEDY_TYPE_PROP)
+    ap.add_argument("--token", action="append", default=[], dest="tokens",
+                    help="tracking number / RMA / credit code; repeat. Required for a "
+                         "replacement (nothing else ties an arrival to THIS remedy).")
+    ap.add_argument("--from-board", action="store_true",
+                    help="read the case off the live board so `%s` is the REAL property "
+                         "value and not a flag (read-only)." % REMEDY_TYPE_PROP)
     ap.add_argument("--resolved", action="store_true",
                     help="M19 says the vendor actually GRANTED the remedy. Without this the "
                          "gate holds — a case cannot close on an ungranted remedy either.")
     a = ap.parse_args(argv)
 
     case = {"identifier": a.case, "query": a.query}
+    if a.from_board:
+        try:
+            import multica_api as mc
+            hit = next((it for it in mc.list_issues()
+                        if it.get("identifier") == a.case or it.get("id") == a.case), None)
+            if hit is None:
+                raise LookupError("no issue with identifier/id %r" % a.case)
+            hit.setdefault("query", a.query)
+            case = hit
+        except Exception as exc:
+            print("HOLD — could not read %s off the board (%s: %s). A gate that cannot read "
+                  "the case must not let it close." % (a.case, type(exc).__name__, exc))
+            return 3
     try:
-        g = close_gate(case, a.amount, a.since, {"resolved": a.resolved})
+        g = close_gate(case, a.amount, a.since, {"resolved": a.resolved},
+                       remedy_type=a.remedy_type, tokens=a.tokens)
     except Exception as exc:
         print("HOLD — the close gate could not run (%s: %s). A gate that cannot check must "
               "not let a case close." % (type(exc).__name__, exc))
@@ -681,7 +1363,10 @@ def _gate_cli(argv):
 
     print("%s" % g["reason"])
     r = g["refund"]
-    print("  amounts   : %s" % ", ".join(r["amounts"]))
+    print("  remedy    : %s" % (r.get("remedy_type") or "(UNSET — gate cannot run)"))
+    print("  amounts   : %s" % (", ".join(r.get("amounts") or []) or "(n/a)"))
+    if r.get("anchors"):
+        print("  anchors   : %s" % ", ".join(r["anchors"]))
     print("  since     : %s" % r["since"])
     print("  landed    : %s (confidence %s)" % (r["landed"], r["confidence"]))
     for e in r["evidence"]:

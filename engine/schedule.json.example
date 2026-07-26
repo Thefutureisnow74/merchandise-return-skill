@@ -1,0 +1,275 @@
+{
+  "_readme": [
+    "schedule.json — the declarative job manifest for the merchandise-return engine's clock.",
+    "",
+    "The engine is a set of modules that only produce value when something runs them while",
+    "nobody is watching. This file is that something's instruction sheet: it names every job,",
+    "when it runs, which engine modules it runs, which environment it needs, and what a human",
+    "should be told about the result.",
+    "",
+    "scheduler.py reads this file and installs the jobs on whatever host it is running on",
+    "(cron, systemd timers, Windows Task Scheduler, or its own foreground loop).",
+    "",
+    "WHY THIS FILE SHIPS AS *.json.example: the packager's file whitelist ships '*.json.example'.",
+    "It is a real, complete, working manifest, not a stub — scheduler.py loads it directly as the",
+    "built-in default. Copy it to 'schedule.json' (same directory, or your cwd, or point",
+    "$MER_SCHEDULE at it) only when you want to change something; your copy then wins.",
+    "",
+    "NOTHING HOST-SPECIFIC LIVES HERE. No interpreter path, no scripts directory, no container",
+    "name, no log directory, no user identity. Those come from scheduler config (see 'config' in",
+    "scheduler.py --help). This file describes the WORK; config describes the MACHINE."
+  ],
+
+  "version": 1,
+
+  "defaults": {
+    "log_max_lines": 500,
+    "schedule_timezone": "host local time",
+    "_schedule_note": [
+      "Every 'schedule' below is a 5-field cron expression interpreted in the HOST'S LOCAL TIME",
+      "ZONE, because that is what cron, systemd and Task Scheduler all do by default and a clock",
+      "that silently disagrees with the wall clock is worse than no clock. The times were chosen",
+      "as business-hours-local: an alert is only worth as much as the correction that follows it,",
+      "and corrections happen while a human is awake."
+    ]
+  },
+
+  "jobs": [
+    {
+      "name": "mer-engine",
+      "schedule": "0 8-17 * * 1-5",
+      "schedule_human": "hourly, 08:00-17:00, Mon-Fri (local)",
+      "description": "The inbound->action loop: read new mail, classify, draft, then process the veto queue.",
+      "why_on_a_clock": [
+        "This is the engine proper. Vendor mail arrives on the vendor's schedule, not the user's,",
+        "and every tier deadline in the ladder runs against the clock from the moment a reply lands.",
+        "Business hours only: a draft queued at 3am cannot be vetoed by a sleeping human, and the",
+        "veto window is the only thing standing between a machine-written letter and a real vendor."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL",
+        "NANOGPT_API_KEY",
+        "MINIMAX_API_KEY"
+      ],
+      "env": {
+        "MER_ENGINE_SEND": "test",
+        "MER_ENGINE_WINDOW_HOURS": "3"
+      },
+      "env_notes": [
+        "MER_ENGINE_SEND ships as 'test' ON PURPOSE. In test mode every drafted reply is redirected",
+        "to your own mailbox instead of the vendor's, so a fresh install cannot send a stranger's",
+        "vendor a machine-written letter on day one. Watch the drafts for a week; when you trust",
+        "them, change this to 'live'. 'off' drafts nothing at all.",
+        "MER_ENGINE_WINDOW_HOURS is the veto window: how long a queued send sits before it goes out.",
+        "Cancel one with: send_queue.py --veto <id>."
+      ],
+      "log": "mer_engine.log",
+      "steps": [
+        { "module": "mer_hotpath.py", "args": ["--force"], "output": "log" },
+        { "module": "send_queue.py", "args": ["--process"], "output": "log" }
+      ],
+      "step_notes": [
+        "The first step runs mer_engine via mer_hotpath --force rather than calling mer_engine.py",
+        "directly. --force runs exactly the same command, but takes the shared lock first, so this",
+        "hourly job and the every-minute mer-hotpath job can never classify the same reply at once.",
+        "That matters more than it looks: two concurrent runs produce two different LLM drafts, so",
+        "two different body fingerprints, and idempotency.reserve() would permit BOTH. The lock is",
+        "what makes the pair safe -- do not revert this step while mer-hotpath is scheduled.",
+        "send_queue.py --process stays HERE and only here. It is the only thing that drains the",
+        "queue, so a draft queued at 3am physically cannot leave before business hours."
+      ],
+      "stdout": { "mode": "silent" }
+    },
+
+    {
+      "name": "mer-hotpath",
+      "schedule": "* * * * *",
+      "schedule_human": "every minute (local), 24/7",
+      "description": "Event-driven hot path: watch the mailbox cursor and fire the engine the moment a reply lands.",
+      "why_on_a_clock": [
+        "The hourly engine job means a vendor reply can sit unnoticed for an hour, and from Friday",
+        "evening to Monday morning for roughly sixty. Every tier deadline in the ladder is already",
+        "running by then. This job costs one Gmail API call a minute while the mailbox is quiet and",
+        "does nothing else; when the cursor moves and a message was genuinely added to the inbox, it",
+        "dispatches the SAME mer_engine.py the hourly job runs. It is a trigger, not a second engine.",
+        "It runs 24/7 on purpose and is still safe overnight, because it never drains the send queue:",
+        "send_queue.py --process stays on the business-hours mer-engine job, so a draft queued at 3am",
+        "cannot go out before a human is awake to veto it."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL",
+        "NANOGPT_API_KEY",
+        "MINIMAX_API_KEY"
+      ],
+      "env": {
+        "MER_ENGINE_SEND": "test",
+        "MER_ENGINE_WINDOW_HOURS": "3"
+      },
+      "env_notes": [
+        "MER_ENGINE_SEND must match the mer-engine job -- this dispatches that same module and",
+        "deliberately never sets the send gate itself.",
+        "MER_HOTPATH_MIN_INTERVAL / MAX_INTERVAL / BACKOFF only affect --run-forever, not this job.",
+        "On a host with no minute-granularity cron, drop this job and run",
+        "'mer_hotpath.py --run-forever' under a supervisor instead."
+      ],
+      "log": "mer_hotpath.log",
+      "steps": [
+        { "module": "mer_hotpath.py", "args": [], "output": "log" }
+      ],
+      "stdout": { "mode": "silent" }
+    },
+
+    {
+      "name": "mer-case-tick",
+      "schedule": "0 9 * * *",
+      "schedule_human": "daily at 09:00 (local)",
+      "description": "The daily case tick: walk every open case, compute what is due, surface only what needs a human.",
+      "why_on_a_clock": [
+        "Deadlines pass whether or not any mail arrives. The tick is the only job that fires on the",
+        "mere passage of time, so it is what keeps a silent case from quietly aging out. Once a day",
+        "is the right sampling rate for quantities measured in days."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL",
+        "NANOGPT_API_KEY",
+        "MINIMAX_API_KEY"
+      ],
+      "env": {
+        "MER_ENGINE_SEND": "test",
+        "MER_ENGINE_WINDOW_HOURS": "3"
+      },
+      "log": "case_tick.log",
+      "steps": [
+        { "module": "case_tick.py", "args": ["--live"], "output": "log+match" }
+      ],
+      "stdout": {
+        "mode": "match",
+        "match": "\\[(DUE|OVERDUE|NUDGE|NEEDS-YES)",
+        "header": "Case tick - cases needing action:",
+        "footer": "(full board: your Multica workspace)"
+      }
+    },
+
+    {
+      "name": "mer-calendar-sync",
+      "schedule": "30 9 * * *",
+      "schedule_human": "daily at 09:30 (local)",
+      "description": "Mirror each open case's phase deadline onto its due date, then upsert one all-day calendar event per dated case.",
+      "why_on_a_clock": [
+        "Two steps, in order, because the calendar reads the due date the first step writes.",
+        "This is the only job that always speaks: it prints a one-line summary every run so the",
+        "clock itself is auditable. Everything else here is silent-when-healthy, and a set of jobs",
+        "that are all silent gives you no way to tell 'nothing wrong' from 'nothing running'."
+      ],
+      "env_from_file": ["MULTICA_TOKEN", "MULTICA_WORKSPACE_ID", "MULTICA_SERVER_URL"],
+      "env": {},
+      "log": "calendar_sync.log",
+      "steps": [
+        { "module": "sync_deadlines.py", "args": ["--live"], "output": "log+match" },
+        { "module": "multica_calendar_sync.py", "args": [], "output": "log+match" }
+      ],
+      "stdout": {
+        "mode": "summary",
+        "lines": [
+          { "match": "^summary", "prefix": "  deadlines: " },
+          { "match": "^calendar_sync", "prefix": "  calendar:  " }
+        ]
+      }
+    },
+
+    {
+      "name": "mer-delivery-check",
+      "schedule": "0 8,12,16 * * *",
+      "schedule_human": "08:00, 12:00 and 16:00 daily (local)",
+      "description": "Post-send bounce sweep. Read-only: reads the send ledger and the mailbox, sends nothing.",
+      "why_on_a_clock": [
+        "Sending reports success the moment the mail server accepts the message for relay. A message",
+        "can be accepted and bounce minutes later, and nothing in the engine ever looks back — so a",
+        "dead escalation looks alive while its deadline clock keeps running. Three passes a day means",
+        "a bounce surfaces within about four working hours; the overnight sends are caught at 08:00.",
+        "Do not raise the frequency without lowering DELIVERY_CHECK_LOOKBACK_HOURS, or you will just",
+        "re-report the same bounce more often."
+      ],
+      "env_from_file": ["MER_PROFILE", "MER_GOOGLE_TOKEN_FILE", "MER_SENDER", "MER_SENT_LEDGER"],
+      "env": { "DELIVERY_CHECK_LOOKBACK_HOURS": "48" },
+      "log": "delivery_check.log",
+      "steps": [
+        { "module": "delivery_check.py", "args": ["--cron"], "output": "alert" }
+      ],
+      "stdout": {
+        "mode": "alert",
+        "footer": "(read-only observation; nothing was re-sent)",
+        "fail_rc_above": 1,
+        "fail_message": "delivery_check exited {rc} with no output - the bounce sweep did not complete."
+      }
+    },
+
+    {
+      "name": "mer-sol-watchdog",
+      "schedule": "0 10 * * 1",
+      "schedule_human": "Mondays at 10:00 (local)",
+      "description": "Statute-of-limitations sweep. Read-only: reads the board and prints, writes nothing.",
+      "why_on_a_clock": [
+        "Every other deadline in the engine is our own. The statute of limitations is the OUTER clock,",
+        "and nothing in the loop watches it: a case can be perfectly on schedule against every internal",
+        "deadline and still cross the date after which no suit — and so no credible threat of suit — is",
+        "possible. The limitations period moves exactly seven days per week, so a daily check would",
+        "produce six identical answers and one useful one. Weekly is the correct sampling rate.",
+        "Monday morning puts it at the start of a week with time left to act."
+      ],
+      "env_from_file": ["MULTICA_TOKEN", "MULTICA_WORKSPACE_ID", "MULTICA_SERVER_URL"],
+      "env": { "SOL_ALERT_DAYS": "90" },
+      "log": "sol_watchdog.log",
+      "steps": [
+        { "module": "sol_watchdog.py", "args": ["--cron"], "output": "alert" }
+      ],
+      "stdout": {
+        "mode": "alert",
+        "footer": "(record-only observation; nothing was written to the board)",
+        "fail_rc_above": 0,
+        "fail_message": "sol_watchdog exited {rc} with no output - the SoL sweep did not complete."
+      }
+    },
+
+    {
+      "name": "mer-unmatched-review",
+      "schedule": "30 10 * * 1",
+      "schedule_human": "Mondays at 10:30 (local)",
+      "description": "Weekly missed-mail sweep: return-related inbound that matched no live case query. Read-only.",
+      "why_on_a_clock": [
+        "The engine matches inbound to a case by a per-case mailbox query. That is precise but narrow,",
+        "and mail it does not match is mail the engine never sees at all — so no event inside the loop",
+        "can ever trigger a review of it. Only a sweep over the whole inbox can. This is a slow leak,",
+        "not an emergency, and a week's accumulation is small enough to read in one sitting, which is",
+        "what makes it get read. The window is 8 days against a 7-day cadence: the extra day is",
+        "deliberate overlap so a late or skipped run cannot open a hole.",
+        "The 30-minute offset from the SoL sweep keeps two mailbox jobs off the same minute."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL",
+        "NANOGPT_API_KEY",
+        "MINIMAX_API_KEY",
+        "MER_PROFILE"
+      ],
+      "env": { "UNMATCHED_REVIEW_WINDOW": "newer_than:8d" },
+      "log": "unmatched_review.log",
+      "steps": [
+        { "module": "unmatched_review.py", "args": ["--cron"], "output": "alert" }
+      ],
+      "stdout": {
+        "mode": "alert",
+        "footer": "(read-only observation; no case was opened and no mail was answered)",
+        "fail_rc_above": 0,
+        "fail_message": "unmatched_review exited {rc} with no output - the missed-mail sweep did not complete."
+      }
+    }
+  ]
+}

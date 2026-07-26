@@ -126,6 +126,39 @@ from advancing until answered, because cases die without them:
   done, by whom, and when. Facts only. The engine will never manufacture this claim, and neither
   should you.
 
+### 3d. Give it a clock — run this once
+
+**This is the step people skip, and it is the one that makes the rest of it work.**
+
+Without a clock, everything here happens only while you are sitting in front of it. The engine can
+draft the letter, compute the deadline and check whether the refund landed — on demand, forever —
+and it will never once notice that a deadline passed on a Tuesday while you were at work. A vendor's
+silence produces no event. The statute of limitations produces no event. Those are exactly the
+failures that kill a case, and only a clock catches a non-event.
+
+```
+cd engine
+python3 scheduler.py --install          # prints the plan, changes nothing
+python3 scheduler.py --install --live   # actually installs it
+python3 scheduler.py --status           # what is installed, and when did it last run?
+```
+
+It works out what your machine uses — cron, systemd timers, or Windows Task Scheduler — and installs
+six jobs: the mail loop (business hours), the daily case tick, the calendar sync, a bounce check
+three times a day, and two Monday-morning sweeps. On a host with no scheduler at all,
+`python3 scheduler.py --run-forever` **is** the clock.
+
+Three things worth knowing now:
+
+- **`--dry-run` is the default.** Nothing touches your crontab until you type `--live`.
+- **It ships in `test` mode.** For your first week every drafted reply is redirected to your own
+  mailbox, not a vendor's. See section 5 for the switch.
+- **Silence means healthy.** Five of the six jobs print nothing when all is well, on purpose. Full
+  detail always goes to a log next to the engine.
+
+Full detail — editing the schedule, pointing it at a different Python, container prefixes,
+troubleshooting: **`references/scheduler.md`**.
+
 ### "But my warranty expired" / "it's been two years" — bring it anyway
 
 **This engine will not tell you your claim is too old.** That is the vendor's line, and it is not
@@ -232,8 +265,9 @@ A vetoed record is dropped permanently on the next pass. It does not come back.
 
 ### Stop all sending
 
-The single switch is the environment variable `MER_ENGINE_SEND`, set in the cron wrapper
-(`mer_engine_cron.sh`, `case_tick_cron.sh`):
+The single switch is the environment variable `MER_ENGINE_SEND`, set per job in the schedule
+manifest (`schedule.json` — copy `schedule.json.example` and edit your copy, then re-run
+`python3 scheduler.py --install --live`):
 
 | Value | Effect |
 |---|---|
@@ -246,8 +280,14 @@ send, addressed to you, before a vendor ever gets one.
 
 ### Stop everything
 
-Disable the cron jobs (`mer-engine`, `mer-case-tick`, `mer-calendar-sync`). The engine has no other
-way to act — it does nothing between scheduled runs.
+Take the clock away:
+
+```
+python3 scheduler.py --uninstall --live
+```
+
+That removes every job it installed — and nothing else. The engine has no other way to act; it does
+nothing at all between scheduled runs.
 
 ---
 

@@ -18,7 +18,29 @@ channel: Tier1 first contact, Tier2 executives, Tier3 regulators, PreSuit statut
 Tier4) also sets `MR Awaiting User YES`, so the case parks for the user's explicit YES before
 the outbound for that phase goes anywhere. The ladder climbs; the letters still wait for a human.
 
+M44 — THE WRITE IS NOW PROVEN, AND CLIENT CASES ARE FENCED OUT. Two holes were left open by
+M37 and are closed here:
+
+  1. NO READ-BACK. `PUT /api/issues/<id>` with a {"properties": …} body returns 200 OK and
+     SILENTLY DISCARDS them (see multica_api.set_properties). set_properties already uses the
+     correct per-property endpoint, but "the correct endpoint" is a belief, not a proof: any
+     future schema change, permission change, or option-id drift would make the write a no-op
+     while the tick logged "ADVANCED" and idempotency recorded the advance as done — a ladder
+     that reports climbing while standing still. advance() now RE-READS the issue after every
+     write and compares the stored value to what it asked for. A mismatch is a failure, the
+     idempotency reservation is RELEASED so the next tick can retry, and nothing is claimed.
+  2. CLIENT CASES COULD AUTO-ADVANCE. gate_check had no notion of a client case, so a
+     `CLIENT:`-titled case with an elapsed Tier1 deadline would climb — and entering a tier is
+     what queues third-party contact. Client cases need written authorization first (and a
+     separate authorization before any regulatory filing), so they are now refused outright:
+     the engine reports them and a human advances them by hand.
+
+Also added: a substantive-vendor-reply hold. Advancement means "the counterparty went silent
+through the whole window"; if the case record logs a reply NEWER than the current phase's
+outbound, the window did not lapse in silence and a human decides what the reply means.
+
 Gates that must hold (non-negotiable product rules, enforced structurally below):
+  * never auto-advance a CLIENT case — third-party contact needs written authorization;
   * never advance a case with `MR Awaiting User YES` true;
   * never advance past Intake/CaseFile unless `MR Intake Complete` is true;
   * never advance INTO Tier4/court unless remedy_gate.remedy_complete() clears (and it
@@ -27,12 +49,15 @@ Gates that must hold (non-negotiable product rules, enforced structurally below)
     action needing the user's explicit YES — "escalated internally" never closes a case);
   * advancement is idempotent — re-running the tick the same day cannot double-advance
     (idempotency.reserve on a phase_advance key, plus the freshly-armed future deadline,
-    which puts the case straight back into WAIT).
+    which puts the case straight back into WAIT);
+  * an advancement that did not verifiably land on the board is NOT an advancement — the
+    reservation is released and the case is reported as not advanced.
 
 Default --dry-run (prints the plan, writes NOTHING). --live advances + arms deadlines + logs.
 Deployed to /opt/data/scripts/ ; run by the container's hourly-business / daily cron.
 """
 import os
+import re
 import sys
 from datetime import date, datetime
 
@@ -94,9 +119,121 @@ COURT_PHASES = {"Tier4"}
 CLOSED_STATUSES = {"done", "cancelled", "closed"}
 ADVANCING_CODES = {"ADVANCE", "DUE", "OVERDUE"}
 
+# ---- client-case detection (M44) -------------------------------------------------------
+# Same CONVENTION mer_engine.is_client_case() uses, reimplemented here as a pure function so
+# the gate is unit-testable offline and case_tick does not have to import mer_engine's whole
+# send stack (gmail_transport, classify_llm, …) just to answer "is this the operator's client?".
+# mer_engine's answer is OR-ed in when it happens to be importable — the test is deliberately
+# FAIL-SAFE / one-way: any single signal marks a case as a client case. A false positive costs
+# a human advancing one case by hand; a false negative opens a new channel against a third
+# party on someone else's behalf without their written authorization. Widen, never narrow.
+CLIENT_TITLE_PREFIX = "CLIENT:"
+CLIENT_DESC_MARKER = "CLIENT CASE"
+AFFIRMATIVE = {"yes", "true", "y", "1", "client", "client case", "on", "checked", "✓"}
+
+# ---- substantive-reply detection (M44) -------------------------------------------------
+# Description blocks in which a vendor reply is logged. Advancement means "the window lapsed
+# in silence"; a reply logged AFTER the current phase's outbound means it did not.
+REPLY_BLOCKS = ("REPLIES", "REPLY", "RECEIVED", "VENDOR REPLY", "INBOUND")
+SENT_BLOCK = "SENT"
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
 
 def truthy(v):
     return str(v).lower() in ("true", "1", "yes", "✓")
+
+
+def _affirmative(val):
+    if val is True:
+        return True
+    if val is False or val is None:
+        return False
+    return str(val).strip().lower() in AFFIRMATIVE
+
+
+def _block(desc, label):
+    """Text of a 'LABEL: …' block, up to the next blank line. Mirrors case_queries._block."""
+    if not desc:
+        return ""
+    m = re.search(r"(?ms)^\s*%s\s*:\s*(.+?)(?:\n\s*\n|\Z)" % re.escape(label), desc)
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+
+
+def is_client_case(issue):
+    """True if this case is run on behalf of the operator's CLIENT rather than the user.
+
+    `issue` is a raw board issue dict OR the plain case_view dict — both carry title,
+    description and mr/properties under the same keys.
+    """
+    issue = issue or {}
+    if (issue.get("title") or "").strip().upper().startswith(CLIENT_TITLE_PREFIX):
+        return True
+    if (issue.get("description") or "").lstrip().upper().startswith(CLIENT_DESC_MARKER):
+        return True
+    for name, val in (issue.get("mr") or {}).items():
+        if "client" in str(name).lower() and _affirmative(val):
+            return True
+    # OR in the engine's own detector, but ONLY if mer_engine is ALREADY loaded. Importing it
+    # here would drag gmail_transport / classify_llm into a pure predicate that runs on every
+    # issue of every board walk — a heavy, credential-touching import on the send path, to
+    # re-derive a rule this function already implements identically. One-way widening only.
+    me = sys.modules.get("mer_engine")
+    if me is not None:
+        try:
+            if me.is_client_case(issue.get("identifier"), issue):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _latest_date(text):
+    """The newest ISO date appearing in a chunk of record text, or None."""
+    best = None
+    for raw in _DATE_RE.findall(text or ""):
+        try:
+            d = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if best is None or d > best:
+            best = d
+    return best
+
+
+def vendor_reply_hold(desc, mr=None):
+    """(hold: bool, why: str) — did the vendor answer this phase's outbound?
+
+    An advancement asserts the counterparty went silent for the whole window. If the case
+    record logs a reply NEWER than the most recent outbound, it did not, and a human decides
+    what the reply means before a new channel is opened.
+
+    Signals, in order:
+      * an affirmative `MR Vendor Replied`-style property (opt-in; absent from the default
+        schema, so this costs nothing on a stock board);
+      * a REPLIES/RECEIVED/… block whose newest date is >= the newest date in the SENT block.
+    A reply block with dates but a SENT block with none is held (fail-safe): we cannot show
+    the reply is stale, and holding only costs a manual escalation.
+    Clearing a hold is a human action: log the newer outbound in SENT, or clear the block.
+    """
+    for name, val in (mr or {}).items():
+        n = str(name).lower()
+        if "replied" in n or "reply received" in n:
+            if _affirmative(val):
+                return True, "%s is affirmative — a vendor reply is on record" % name
+    reply_txt = " ".join(_block(desc, lab) for lab in REPLY_BLOCKS).strip()
+    if not reply_txt:
+        return False, ""
+    reply_at = _latest_date(reply_txt)
+    if not reply_at:
+        return False, ""
+    sent_at = _latest_date(_block(desc, SENT_BLOCK))
+    if sent_at is None:
+        return True, ("a vendor reply is logged (%s) and the record has no dated %s line to "
+                      "show it is stale — holding" % (reply_at, SENT_BLOCK))
+    if reply_at >= sent_at:
+        return True, ("a vendor reply dated %s is newer than this phase's outbound (%s) — the "
+                      "window did not lapse in silence; a human reads the reply" % (reply_at, sent_at))
+    return False, ""
 
 
 def _levers(v):
@@ -142,8 +279,8 @@ def gate_check(case, today=None):
 
     `case` is a plain dict (see case_view) — no network, no board object — so the whole gate
     is unit-testable offline:
-        {identifier, status, phase, deadline(date|None), intake_done, awaiting_yes,
-         remedy_map[], remedy_attempted[]}
+        {identifier, title, description, status, phase, deadline(date|None), intake_done,
+         awaiting_yes, remedy_map[], remedy_attempted[], mr{}}
 
     Returns (allowed: bool, target_phase: str|None, deadline: date|None, reason: str).
     Every refusal names the rule it is enforcing.
@@ -158,6 +295,15 @@ def gate_check(case, today=None):
         return False, None, None, "no MR Phase set — not in the engine"
     if phase in NEVER_WRITE_PHASES or phase == "Closed":
         return False, None, None, "phase %r is terminal — the engine never advances or closes it" % phase
+
+    # GATE 0 — CLIENT CASES NEVER AUTO-ADVANCE. Entering a tier is what queues contact with a
+    # third party on someone else's behalf, and that needs the client's WRITTEN authorization
+    # (and a separate authorization before any regulatory filing). No timer can supply consent,
+    # so no timer may move a client case. The engine reports it; a human advances it by hand.
+    if is_client_case(case):
+        return False, None, None, ("client case (CLIENT: convention) — client cases NEVER "
+                                   "auto-advance; third-party contact needs the client's written "
+                                   "authorization, which no elapsed timer can supply")
 
     # GATE 1 — an action is parked on the user's explicit YES. Nothing moves.
     if case.get("awaiting_yes"):
@@ -184,6 +330,13 @@ def gate_check(case, today=None):
         if (deadline - today).days > 0:
             return False, None, None, "%s deadline %s has not elapsed (%dd left)" % (
                 phase, deadline, (deadline - today).days)
+
+        # GATE 3b — the window must have lapsed IN SILENCE. A substantive vendor reply logged
+        # after this phase's outbound means the counterparty engaged; escalating to a new
+        # channel over the top of a live conversation is a human's call, not a timer's.
+        held, why = vendor_reply_hold(case.get("description"), case.get("mr"))
+        if held:
+            return False, None, None, "substantive vendor reply on record — %s" % why
 
     # GATE 4 — court is structurally unreachable until the remedy map is exhausted.
     if target in COURT_PHASES:
@@ -216,6 +369,10 @@ def case_view(issue):
         "identifier": issue.get("identifier"),
         "id": issue.get("id"),
         "title": issue.get("title") or "",
+        # M44: description + the raw mr map travel with the view so the client-case gate and
+        # the substantive-reply gate stay pure functions of a plain dict (offline-testable).
+        "description": issue.get("description") or "",
+        "mr": p,
         "status": (issue.get("status") or "").lower(),
         "phase": p.get(PHASE_PROP),
         "deadline": deadline,
@@ -226,12 +383,85 @@ def case_view(issue):
     }
 
 
+def _release_reservation(key):
+    """Undo an idempotency reservation whose write did not land.
+
+    reserve() records BEFORE the write — that ordering is correct (it is what makes a
+    concurrent second tick unable to double-write), but it means a FAILED or SILENTLY
+    DISCARDED write would be remembered forever as "already advanced" and the case could
+    never be retried. So a write we could not verify releases its own key.
+
+    Implemented against idempotency's own primitives rather than by editing that module:
+    the ledger is a plain dict keyed by send_key, atomically rewritten.
+    """
+    try:
+        data = idempotency._load()
+        if key in data:
+            del data[key]
+            idempotency._atomic_save(data)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _same_value(want, got, pdef=None):
+    """Did the board store what we asked for? Compared as normalized strings.
+
+    Dates come back as '2026-08-05' or '2026-08-05T00:00:00Z'; selects come back either as the
+    option label (list_issues resolves them) or the raw option id (get_issue does not), so an
+    id that maps to the wanted label also counts as a match.
+    """
+    if isinstance(want, bool):
+        return truthy(got) == want
+    w = str(want).strip().lower()
+    g = str(got).strip().lower()
+    if w == g:
+        return True
+    if len(w) == 10 and w[:4].isdigit() and g.startswith(w):     # date vs datetime
+        return True
+    if pdef and (pdef.get("options") or {}):
+        label = pdef["options"].get(got)
+        if label is not None and str(label).strip().lower() == w:
+            return True
+    return False
+
+
+def verify_written(issue_id, values_by_name, defs):
+    """Re-read the issue and prove every value actually landed. Returns (ok, detail).
+
+    ⚠️ THIS IS THE WHOLE POINT OF M44. `PUT /api/issues/<id>` with a {"properties": …} body
+    returns 200 OK and silently discards them — a success response for a write that never
+    happened. set_properties uses the correct per-property endpoint, but no HTTP status can
+    prove a value is on the board; only reading it back can. Without this check a broken
+    write would make case_tick log "ADVANCED" for a case that never moved.
+    """
+    raw = mc.get_issue(issue_id)
+    props = (raw or {}).get("properties") or {}
+    resolved = (raw or {}).get("mr") or {}      # present when get_issue fell back to list_issues
+    bad = []
+    for name, want in values_by_name.items():
+        d = (defs or {}).get(name) or {}
+        got = props.get(d.get("id")) if d.get("id") in props else resolved.get(name)
+        if not _same_value(want, got, d):
+            bad.append("%s: wanted %r, board has %r" % (name, want, got))
+    if bad:
+        return False, "; ".join(bad)
+    return True, "read-back confirms " + ", ".join("%s=%s" % (k, v)
+                                                   for k, v in values_by_name.items())
+
+
 def advance(issue, view, target, new_deadline, mer16_id=None, defs=None):
     """Write the advancement to the board. LIVE ONLY — callers must gate on --live.
 
     Idempotent: idempotency.reserve() keys the write on (case, phase_advance:from->to,
     target+deadline). A second run the same day is refused before any HTTP call. The
     freshly-armed future deadline is the second, structural guard: the case reads WAIT.
+
+    VERIFIED: the write is read back off the board before this returns success. A write that
+    raised, or that returned 200 and changed nothing, releases its idempotency reservation and
+    is reported as NOT advanced — so the next tick retries instead of the case being silently
+    stranded with the ledger insisting it already climbed.
     """
     ident = view["identifier"]
     key_body = "%s|%s" % (target, new_deadline)
@@ -249,7 +479,24 @@ def advance(issue, view, target, new_deadline, mer16_id=None, defs=None):
     if red:
         # Entering a new channel is a 🔴 action: the phase climbs, the outbound waits for YES.
         values[YES_PROP] = True
-    mc.set_properties(issue, values, defs=defs)
+    try:
+        mc.set_properties(issue, values, defs=defs)
+    except Exception as e:
+        _release_reservation(key)
+        return False, ("the property write FAILED (%s: %s) — reservation released, the next "
+                       "tick will retry. NOTHING was advanced." % (type(e).__name__, e))
+
+    # --- READ-BACK. No success is claimed on the strength of an HTTP 200 alone. ---
+    try:
+        verified, detail = verify_written(issue["id"], values, defs)
+    except Exception as e:
+        verified, detail = False, "read-back itself failed (%s: %s)" % (type(e).__name__, e)
+    if not verified:
+        _release_reservation(key)
+        return False, ("WRITE DID NOT LAND — %s. The API accepted the call but the board does "
+                       "not show the new value (this is the 200-OK-and-silently-discards trap; "
+                       "see multica_api.set_properties). Reservation released; %s was NOT "
+                       "advanced and the next tick will retry." % (detail, ident))
 
     note = ("RECORD ONLY - NO ACTION REQUIRED [re %s]. Phase advanced %s -> %s by the daily tick "
             "(gate elapsed/cleared). New %s = %s (%s business days, businessday.py). %s"
@@ -264,8 +511,8 @@ def advance(issue, view, target, new_deadline, mer16_id=None, defs=None):
         mc.add_comment(target_issue, note)
     except Exception as e:
         return True, "advanced, but the RECORD-ONLY log failed: %s" % e
-    return True, "advanced %s -> %s; deadline %s%s" % (
-        view["phase"], target, new_deadline, "; awaiting-YES set" if red else "")
+    return True, "advanced %s -> %s; deadline %s%s (%s)" % (
+        view["phase"], target, new_deadline, "; awaiting-YES set" if red else "", detail)
 
 
 def build_remedy_map(issue, view, mer16_id=None, defs=None):
@@ -509,10 +756,139 @@ def _selftest():
           "1st reserve=%s, 2nd reserve=%s (expect True/False)" % (ok1, ok2))
     os.remove(ledger)
 
-    # 14. dry-run writes nothing: main() only calls advance() under --live (asserted structurally).
+    # 14. dry-run writes nothing. Proved on the AST, not by grepping for a substring: every
+    #     call to a writing function in main() must sit inside an `if`/`elif` whose test
+    #     mentions `live`. A rearranged branch that lost the gate would now FAIL here.
+    import ast
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
-    check("advance() is only reachable under --live", "elif not live:" in src and "advance(it, v," in src,
-          True, "dry-run branch precedes the write branch in main()")
+    tree = ast.parse(src)
+    parents = {}
+    for nd in ast.walk(tree):
+        for kid in ast.iter_child_nodes(nd):
+            parents[kid] = nd
+
+    def _live_gated(call_node):
+        nd = call_node
+        while nd in parents:
+            nd = parents[nd]
+            if isinstance(nd, ast.If) and "live" in {n.id for n in ast.walk(nd.test)
+                                                     if isinstance(n, ast.Name)}:
+                return True
+            if isinstance(nd, ast.FunctionDef) and nd.name == "main":
+                return False
+        return False
+
+    main_fn = next(nd for nd in tree.body if isinstance(nd, ast.FunctionDef) and nd.name == "main")
+    for fname in ("advance", "build_remedy_map"):
+        calls = [nd for nd in ast.walk(main_fn)
+                 if isinstance(nd, ast.Call) and getattr(nd.func, "id", None) == fname]
+        check("%s() is called at all (a self-test is not a wired module)" % fname,
+              bool(calls), True, "%d call site(s) in main()" % len(calls))
+        check("%s() is unreachable without --live" % fname,
+              bool(calls) and all(_live_gated(c) for c in calls), True,
+              "every call site sits inside an `if live` branch (AST-verified)")
+    check("--live is the only thing that sets live",
+          "live = \"--live\" in sys.argv" in src, True, "main() reads the flag from argv")
+
+    # 14b. M44 — CLIENT CASES NEVER AUTO-ADVANCE, by any of the three convention signals, and
+    #     not even when every other gate is wide open (intake done, deadline long elapsed).
+    for label, kw in (
+        ("CLIENT: title prefix", {"title": "CLIENT: Jordan Rivera - tablet via Acme"}),
+        ("'CLIENT CASE' description marker", {"description": "CLIENT CASE. Bought a tablet."}),
+        ("affirmative MR Client Case property", {"mr": {"MR Client Case": "yes"}}),
+        ("MR Client Case = true (bool)", {"mr": {"MR Client Case": True}}),
+    ):
+        a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday, **kw), today)
+        check("client case (%s) never advances" % label, a, False, r, "client case" in r)
+    # ...at every rung of the ladder, including the green-lane intake hop.
+    for ph in ("Intake", "CaseFile", "RemedyMap", "Tier1", "Tier2", "Tier3", "PreSuit"):
+        a, t, d, r = gate_check(_case(phase=ph, deadline=yday,
+                                      title="CLIENT: Jordan Rivera - tablet"), today)
+        check("client case at %s never advances" % ph, a, False, r, "client case" in r)
+    # ...and the identical NON-client case at Tier1 does advance, so the gate is the cause.
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday,
+                                  title="Case: Acme Tools / tablet"), today)
+    check("the same case titled 'Case:' DOES advance", a, True, r, t == "Tier2")
+
+    # 14c. M44 — a substantive vendor reply newer than this phase's outbound holds the gate.
+    rec = ("VENDOR/ITEM: Acme Tools — a tablet.\n\nSENT:\nTier 1 letter on 2026-07-10\n"
+           "\nREPLIES:\nAcme wrote back 2026-07-20 offering a partial credit\n")
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday, description=rec), today)
+    check("a reply newer than the outbound holds the gate", a, False, r, "vendor reply" in r)
+    stale = ("VENDOR/ITEM: Acme Tools — a tablet.\n\nSENT:\nTier 1 letter on 2026-07-22\n"
+             "\nREPLIES:\nAcme auto-ack 2026-07-02\n")
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday, description=stale), today)
+    check("a reply OLDER than the outbound does not hold", a, True, r, t == "Tier2")
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday,
+                                  mr={"MR Vendor Replied": "yes"}), today)
+    check("an affirmative MR Vendor Replied property holds the gate", a, False, r,
+          "vendor reply" in r)
+
+    # 14d. M44 — THE WRITE IS VERIFIED, NOT ASSUMED. The documented API trap is that
+    #     PUT /api/issues/<id> {"properties": …} answers 200 OK and discards them. Simulate
+    #     exactly that: a set_properties that succeeds and changes nothing. advance() must
+    #     report FAILURE and must RELEASE its idempotency reservation so the next tick retries.
+    idempotency.LEDGER = ledger = os.path.join(tempfile.gettempdir(), "mer_ledger_m44_test.json")
+    if os.path.exists(ledger):
+        os.remove(ledger)
+    board_state = {PHASE_PROP: "Tier1", DEADLINE_PROP: "2026-07-26"}
+    real_set, real_get, real_comment = mc.set_properties, mc.get_issue, mc.add_comment
+    comments = []
+
+    def _silently_discard(issue, values, ws=None, defs=None):
+        return {"ok": True}                       # 200 OK, board unchanged — the trap
+
+    def _honest_set(issue, values, ws=None, defs=None):
+        board_state.update({k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                            for k, v in values.items()})
+        return {"ok": True}
+
+    def _fake_get(issue_id, ws=None):
+        return {"id": issue_id, "properties": {}, "mr": dict(board_state)}
+
+    try:
+        mc.set_properties, mc.get_issue = _silently_discard, _fake_get
+        mc.add_comment = lambda iid, content, ws=None: comments.append((iid, content))
+        v = _case(phase="Tier1", deadline=yday)
+        want_dl = businessday.business_day_deadline(today, PHASE_SLA_DAYS["Tier2"])
+        done, msg = advance({"id": "t"}, v, "Tier2", want_dl, defs={})
+        check("a silently-discarded write is reported as NOT advanced", done, False, msg,
+              "WRITE DID NOT LAND" in msg)
+        check("...and its idempotency reservation is RELEASED (the tick can retry)",
+              idempotency._load() == {}, True, "ledger is empty after the failed write")
+
+        # the retry, against a board that honours the write, must now succeed.
+        mc.set_properties = _honest_set
+        done, msg = advance({"id": "t"}, v, "Tier2", want_dl, defs={})
+        check("the retry advances once the write lands", done, True, msg,
+              "read-back confirms" in msg)
+        check("read-back saw the NEW phase on the board", board_state[PHASE_PROP], "Tier2",
+              "board now: %s" % board_state)
+        check("entering a RED-lane phase set awaiting-YES on the board",
+              truthy(board_state.get(YES_PROP)), True, "%s=%r" % (YES_PROP, board_state.get(YES_PROP)))
+
+        # a write that RAISES must also release, not strand the case.
+        if os.path.exists(ledger):
+            os.remove(ledger)
+
+        def _boom(issue, values, ws=None, defs=None):
+            raise RuntimeError("Multica API PUT -> 503")
+        mc.set_properties = _boom
+        done, msg = advance({"id": "t"}, v, "Tier2", want_dl, defs={})
+        check("a raising write is reported as NOT advanced", done, False, msg, "FAILED" in msg)
+        check("...and releases its reservation too", idempotency._load() == {}, True,
+              "ledger is empty")
+        check("a FAILED advance logs nothing to the board",
+              len(comments), 1, "%d comment(s) — only the one successful advance logged"
+              % len(comments))
+    finally:
+        mc.set_properties, mc.get_issue, mc.add_comment = real_set, real_get, real_comment
+        if os.path.exists(ledger):
+            os.remove(ledger)
+
+    check("advance() reads the value back before claiming success",
+          "verify_written(" in src and "_release_reservation(key)" in src, True,
+          "no success is claimed on an HTTP 200 alone")
 
     # 15. TIER 0 IS WIRED. Court was unreachable by construction because nothing built a
     #     remedy map; a RemedyMap case with an empty map must now produce a real lever list.

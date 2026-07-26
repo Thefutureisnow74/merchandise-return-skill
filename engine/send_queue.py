@@ -37,12 +37,23 @@ def _save(q):
 
 
 def enqueue(case, to, subject, body, action="reply", window_hours=3,
-            in_reply_to=None, references=None):
+            in_reply_to=None, references=None, lever=None):
+    """Queue one outbound. `lever` (M44) is OPTIONAL and defaults to None.
+
+    When a caller names the remedy lever this send IS (e.g. "tier2_exec" for an executive
+    escalation), process() logs that lever to `MR Remedy Attempted` — but only after the
+    send primitive actually reports sent=True. Records without a lever behave exactly as
+    before: nothing is logged, nothing changes.
+
+    The lever is deliberately NOT acted on at enqueue time. A queued letter can still be
+    vetoed during its window, and a vetoed letter marked "attempted" would help open Tier 4
+    on a lever nobody ever pulled.
+    """
     q = _load()
     rec = {
         "id": uuid.uuid4().hex[:8],
         "case": case, "to": to, "subject": subject, "body": body, "action": action,
-        "in_reply_to": in_reply_to, "references": references,
+        "in_reply_to": in_reply_to, "references": references, "lever": lever,
         "queued_at": datetime.now(timezone.utc).isoformat(),
         "send_after": (datetime.now(timezone.utc) + timedelta(hours=window_hours)).isoformat(),
         "vetoed": False,
@@ -83,6 +94,23 @@ def process():
                             action=r.get("action", "reply"),
                             in_reply_to=r.get("in_reply_to"), references=r.get("references"))
         fired.append((r["id"], r["case"], res))
+        if res.get("sent") and r.get("lever"):
+            # M44 — THE CALL SITE `remedy_map.mark_attempted` never had. A lever counts as
+            # attempted only when the letter genuinely left, which is exactly here: after
+            # the veto window closed, after idempotency cleared, after the transport
+            # returned an id. Best-effort and non-fatal by design — the mail is already
+            # gone, so a board hiccup must not be reported as a failed send. A missed log
+            # leaves Tier 4 shut, which is the safe direction; the human path
+            # (`remedy_map.py --mark-attempted --live`) closes the gap.
+            try:
+                import remedy_map
+                lv = remedy_map.log_attempt(r["case"], r["lever"], live=True)
+                fired.append((r["id"], r["case"], "lever-log: %s" % lv["reason"]))
+            except Exception as e:
+                fired.append((r["id"], r["case"],
+                              "lever-log FAILED for %r (%s) — the send DID go out; log it "
+                              "by hand with: remedy_map.py --mark-attempted --case %s "
+                              "--lever %s --live" % (r["lever"], e, r["case"], r["lever"])))
         # keep it queued ONLY if sending is globally disabled (so it fires once enabled);
         # otherwise it's done (sent, idempotency-blocked, or errored — don't loop forever).
         if not res.get("sent") and "sending disabled" in res.get("reason", ""):
@@ -190,6 +218,45 @@ def _selftest():
         snapshot = _load()
         check("veto() on an unknown id returns False", veto("deadbeef") is False)
         check("a failed veto leaves the queue byte-identical", _load() == snapshot)
+
+        # ---- 5b. M44 lever logging: only on a CONFIRMED send, never on a queued one.
+        import remedy_map
+        real_log = remedy_map.log_attempt
+        logged = []
+
+        def _spy_log(case, lever, **kw):
+            logged.append((case, lever, kw.get("live")))
+            return {"reason": "stubbed", "refused": False, "logged": True, "attempted": []}
+        remedy_map.log_attempt = _spy_log
+
+        def _ok_send(to, subject, body, case="", action="reply", in_reply_to=None,
+                     references=None):
+            sent_to.append((case, to, action))
+            return {"sent": True, "mode": "test", "to": to, "gmail_id": "stub"}
+        try:
+            # a record with NO lever logs nothing at all (the pre-M44 shape is untouched)
+            enqueue("MER-T5", "vendor@example.com", "no lever", "b", action="t_nolever",
+                    window_hours=0)
+            mer_send.send = _ok_send
+            process()
+            check("a record with no lever logs nothing", logged == [], str(logged))
+
+            # a VETOED record with a lever never reaches the log — it never sent
+            lv = enqueue("MER-T6", "vendor@example.com", "vetoed", "b", action="t_vetolev",
+                         window_hours=0, lever="bbb")
+            veto(lv)
+            process()
+            check("a vetoed lever is NEVER logged as attempted", logged == [], str(logged))
+
+            # a record that ACTUALLY sends logs its lever, live
+            enqueue("MER-T7", "vendor@example.com", "real", "b", action="t_lever",
+                    window_hours=0, lever="tier2_exec")
+            process()
+            check("a confirmed send logs its lever live",
+                  logged == [("MER-T7", "tier2_exec", True)], str(logged))
+        finally:
+            remedy_map.log_attempt = real_log
+            mer_send.send = spy
 
         # ---- 6. the real (un-spied) send primitive refuses while MER_ENGINE_SEND=off.
         mer_send.send = real_send

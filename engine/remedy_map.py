@@ -825,18 +825,21 @@ def write(issue, levers, defs=None, ws=None):
     return levers
 
 
-def mark_attempted(issue, lever, defs=None, ws=None):
+def mark_attempted(issue, lever, defs=None, ws=None, api=None):
     """Append `lever` to `MR Remedy Attempted`, idempotently.
 
     Never duplicates a lever and never loses an existing one: the current value is read from
     the issue, merged as a set, and rewritten in ladder order. Returns (changed, [levers]).
     Accepts a single key or an iterable of keys.
+
+    `api` is injectable so a caller's self-test can prove the write path without a token —
+    before M44 the only way to exercise this function was against the live board.
     """
     new = [lever] if isinstance(lever, str) else list(lever or [])
     new = [str(x).strip() for x in new if str(x).strip()]
     if not new:
         return False, parse_levers((issue.get("mr", {}) or {}).get(REMEDY_DONE_PROP))
-    mc = _api()
+    mc = api if api is not None else _api()
     if not isinstance(issue, dict) or "mr" not in issue:
         # A bare id / raw issue: re-read so we can never clobber an existing value.
         got = mc.get_issue(issue if not isinstance(issue, dict) else issue["id"], ws)
@@ -855,6 +858,165 @@ def mark_attempted(issue, lever, defs=None, ws=None):
     if isinstance(issue.get("mr"), dict):
         issue["mr"][REMEDY_DONE_PROP] = serialize(merged)
     return True, merged
+
+
+# The lever an outbound in a given MR Phase IS. Used by callers that want to pass
+# `lever=` to send_queue.enqueue() so a successful send logs itself.
+#
+# Tier3 is DELIBERATELY ABSENT. It is not one lever but several distinct filings
+# (industry_regulator / state_ag / bbb / ftc), each on its own portal, and only the person
+# who filed knows which one went. Guessing would mark three levers done off one action and
+# open court early — the exact 2026-07-17 gate-jump this system exists to prevent. Those
+# are logged by hand: `remedy_map.py --mark-attempted --case X --lever bbb --live`.
+PHASE_LEVER = {
+    "Tier1": "tier1_vendor",
+    "Tier2": "tier2_exec",
+    "PreSuit": "pre_suit_notice",
+}
+
+
+# =========================================================================================
+# INTEGRATION NOTE — the two call sites this module cannot add for itself (M44)
+# =========================================================================================
+# `case_tick.py` and `nudge.py` are owned elsewhere and a live vendor send runs off them, so
+# nothing below was applied. Both are one-line, additive, and no-ops until used.
+#
+# 1. nudge.py, function enqueue_due(), ~line 269 — and the identical call in main(), ~line
+#    311. Currently:
+#        rid = send_queue.enqueue(n["case"], n["to"], n["subject"], n["body"],
+#                                 action=n["action"], window_hours=0)
+#    Add ONE keyword:
+#                                 lever=remedy_map.PHASE_LEVER.get(n.get("phase")),
+#    (plus `import remedy_map` beside the existing `import send_queue`). n["phase"] must be
+#    the case's MR Phase; if the nudge dict does not carry it, pass None and leave the
+#    automatic path to Tier 1/2/PreSuit sends only. With lever=None — every phase not in
+#    PHASE_LEVER, and every existing caller — behaviour is byte-identical to today.
+#
+# 2. case_tick.py — NO EDIT IS NEEDED OR WANTED. The tick advances phases; it does not send,
+#    and a phase advance is not an attempt. Marking a lever attempted when the phase changes
+#    would log Tier 2 as done at the moment the case ENTERS Tier 2, before a single letter
+#    goes out, and would hand court a cleared gate for work nobody did. The attempt is the
+#    send, and the send happens in send_queue.process(), which is already wired.
+#
+# Until (1) is applied, every lever is logged through the human CLI. That is not a
+# degradation: the majority of levers in a real map (state_ag, bbb, ftc,
+# industry_regulator, arbitration, class_action) are portal filings this engine never
+# sends anyway, so a person was always going to have to say they happened.
+def log_attempt(case, lever, *, live=False, issues=None, ws=None, defs=None, api=None):
+    """M44 — the CALL SITE for mark_attempted(). Log that ONE lever was actually attempted.
+
+    THE GAP THIS CLOSES
+    -------------------
+    `write()` had a caller (case_tick.build_remedy_map) from the day it was written, so
+    `MR Remedy Map` gets populated. `mark_attempted()` had NONE. The consequence is the
+    mirror image of the bug this file was created to fix: the map fills up, nothing ever
+    marks a lever done, `remedy_gate.remedy_complete()` therefore returns
+    ready_for_court=False on every case forever, and Tier 4 is unreachable — again by
+    construction rather than by policy. Two halves of one gate; only one had a hand on it.
+
+    WHAT COUNTS AS AN ATTEMPT
+    -------------------------
+    Done AND logged. Not intended, not drafted, not queued — SENT / FILED. That is why the
+    automatic call site is send_queue.process(), after the send primitive actually reports
+    sent=True, and not at enqueue time: a queued letter can still be vetoed, and a vetoed
+    letter that had been marked "attempted" would open court on a lever nobody ever pulled.
+
+    FAILS CLOSED, in the direction that matters here. Marking a lever attempted OPENS a
+    gate, so every doubt refuses the mark:
+      * an unknown lever key is refused (a typo would silently leave the real lever owed);
+      * a COURT lever is refused (court is the destination, not a prerequisite);
+      * a lever that is not in this case's `MR Remedy Map` is refused, because either the
+        map is wrong or the lever is — both need a human, and neither should be papered
+        over by a write;
+      * an EMPTY map is refused: Tier 0 has not run, so nothing is owed yet and nothing can
+        be satisfied.
+    DRY RUN BY DEFAULT — nothing is written without live=True.
+
+    Returns {"logged", "refused", "reason", "case", "lever", "attempted": [...],
+             "dry_run": bool}.
+    """
+    v = {"logged": False, "refused": False, "reason": "", "case": None, "lever": lever,
+         "attempted": [], "dry_run": not live}
+
+    key = str(lever or "").strip()
+    if not key:
+        v["refused"] = True
+        v["reason"] = "REFUSED: no lever key given."
+        return v
+    if key in remedy_gate.COURT_LEVERS:
+        v["refused"] = True
+        v["reason"] = ("REFUSED: %r is a COURT lever. Court is the destination the gate "
+                       "protects, not a prerequisite for itself." % key)
+        return v
+    if key not in remedy_gate.LEVER_LABELS:
+        v["refused"] = True
+        v["reason"] = ("REFUSED: %r is not a lever remedy_gate knows (%s). A typo here "
+                       "would leave the REAL lever owed while the log claims it is done."
+                       % (key, ", ".join(sorted(k for k in remedy_gate.LEVER_LABELS
+                                                if k not in remedy_gate.COURT_LEVERS))))
+        return v
+
+    # Resolve the case to a real issue, without inventing one.
+    issue = case
+    if not (isinstance(case, dict) and isinstance(case.get("mr"), dict)):
+        ident = case.get("identifier") if isinstance(case, dict) else case
+        try:
+            mc = api if api is not None else _api()
+            board = issues if issues is not None else mc.list_issues()
+            issue = next((it for it in board
+                          if it.get("identifier") == ident or it.get("id") == ident), None)
+        except Exception as exc:
+            v["refused"] = True
+            v["reason"] = ("REFUSED: could not read the board to resolve %r (%s: %s). A "
+                           "gate-opening write on an unread case is not something to guess "
+                           "at." % (ident, type(exc).__name__, exc))
+            return v
+        if issue is None:
+            v["refused"] = True
+            v["reason"] = "REFUSED: no issue on the board with identifier/id %r." % ident
+            return v
+
+    v["case"] = issue.get("identifier") or issue.get("id")
+    props = issue.get("mr", {}) or {}
+    rmap = parse_levers(props.get(REMEDY_MAP_PROP))
+    already = parse_levers(props.get(REMEDY_DONE_PROP))
+    v["attempted"] = already
+
+    if not rmap:
+        v["refused"] = True
+        v["reason"] = ("REFUSED: %s has an EMPTY %s. Tier 0 has not run, so no lever is "
+                       "owed yet and none can be satisfied. Run the remedy map first."
+                       % (v["case"], REMEDY_MAP_PROP))
+        return v
+    if key not in rmap:
+        v["refused"] = True
+        v["reason"] = ("REFUSED: %r is not in %s's %s (%s). Either the map is wrong or the "
+                       "lever is — both need a person, not a write."
+                       % (key, v["case"], REMEDY_MAP_PROP, serialize(rmap)))
+        return v
+    if key in already:
+        v["reason"] = ("Already logged: %r is in %s. No write, no duplicate."
+                       % (key, REMEDY_DONE_PROP))
+        return v
+
+    would = merge_attempted(already, key)
+    if not live:
+        v["reason"] = ("DRY RUN — would set %s = %s on %s. Nothing was written; re-run "
+                       "with --live." % (REMEDY_DONE_PROP, serialize(would), v["case"]))
+        v["attempted"] = would
+        return v
+
+    changed, merged = mark_attempted(issue, key, defs=defs, ws=ws, api=api)
+    v["logged"] = bool(changed)
+    v["attempted"] = merged
+    r = remedy_gate.remedy_complete(rmap, merged)
+    v["reason"] = ("LOGGED %r on %s. %s = %s. %s"
+                   % (key, v["case"], REMEDY_DONE_PROP, serialize(merged),
+                      ("Every applicable lever is now attempted — Tier 4 may open."
+                       if r["ready_for_court"] else
+                       "%d lever(s) still owed before Tier 4: %s"
+                       % (len(r["missing"]), ", ".join(r["missing"])))))
+    return v
 
 
 def merge_attempted(existing, new):
@@ -1057,10 +1219,106 @@ def _selftest():
     check("F: logging onto an empty property works", m3 == ["tier1_vendor"], m3)
     check("F: serialize/parse round-trips", parse_levers(serialize(a["levers"])) == a["levers"])
 
+    # F3 — log_attempt(): the call site mark_attempted never had. Offline, stubbed board.
+    class _StubMC(object):
+        def __init__(self):
+            self.writes = []
+
+        def list_issues(self, ws=None):
+            return _ATTEMPT_BOARD
+
+        def set_properties(self, issue, values, ws=None, defs=None):
+            self.writes.append((issue.get("identifier"), dict(values)))
+            if isinstance(issue.get("mr"), dict):
+                issue["mr"].update(values)
+
+        def get_issue(self, issue_id, ws=None):
+            return next(i for i in _ATTEMPT_BOARD if i["id"] == issue_id)
+
+    def _board():
+        return [
+            {"identifier": "CASE-A", "id": "a",
+             "mr": {"MR Remedy Map": "tier1_vendor, tier2_exec, bbb",
+                    "MR Remedy Attempted": "tier1_vendor"}},
+            {"identifier": "CASE-B", "id": "b",
+             "mr": {"MR Remedy Map": "", "MR Remedy Attempted": ""}},
+        ]
+
+    _ATTEMPT_BOARD = _board()
+    stub = _StubMC()
+    v = log_attempt("CASE-A", "made_up_lever", live=True, api=stub)
+    check("F3: an unknown lever key is REFUSED", v["refused"] and not stub.writes, v["reason"][:60])
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-A", "tier4_court", live=True, api=stub)
+    check("F3: a COURT lever is REFUSED", v["refused"] and not stub.writes)
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-A", "state_ag", live=True, api=stub)
+    check("F3: a lever outside this case's map is REFUSED",
+          v["refused"] and not stub.writes, v["reason"][:70])
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-B", "bbb", live=True, api=stub)
+    check("F3: an EMPTY remedy map REFUSES (Tier 0 has not run)",
+          v["refused"] and not stub.writes)
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-A", "bbb", api=stub)
+    check("F3: DRY RUN writes nothing", not v["logged"] and not stub.writes, str(stub.writes))
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-A", "tier1_vendor", live=True, api=stub)
+    check("F3: re-logging an already-attempted lever writes nothing",
+          not v["logged"] and not stub.writes)
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-A", "bbb", live=True, api=stub)
+    check("F3: a valid, owed lever IS logged", v["logged"] and len(stub.writes) == 1,
+          str(stub.writes))
+    check("F3: the existing attempt survives the merge",
+          parse_levers(stub.writes[0][1][REMEDY_DONE_PROP]) == ["tier1_vendor", "bbb"],
+          str(stub.writes[0][1]))
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-A", "tier2_exec", live=True, api=stub)
+    v = log_attempt("CASE-A", "bbb", live=True, api=stub)
+    check("F3: once every owed lever is logged, the gate reports court open",
+          remedy_gate.remedy_complete(["tier1_vendor", "tier2_exec", "bbb"],
+                                      v["attempted"])["ready_for_court"], str(v["attempted"]))
+
+    _ATTEMPT_BOARD = _board(); stub = _StubMC()
+    v = log_attempt("CASE-NOPE", "bbb", live=True, api=stub)
+    check("F3: an unknown case is REFUSED, not created", v["refused"] and not stub.writes)
+
+    check("F3: every PHASE_LEVER value is a lever remedy_gate consumes",
+          set(PHASE_LEVER.values()) <= set(remedy_gate.LEVER_LABELS),
+          str(sorted(set(PHASE_LEVER.values()) - set(remedy_gate.LEVER_LABELS))))
+    check("F3: no PHASE_LEVER maps a phase to a COURT lever",
+          not (set(PHASE_LEVER.values()) & remedy_gate.COURT_LEVERS))
+    check("F3: Tier3 is NOT auto-mapped (it is four separate filings)",
+          "Tier3" not in PHASE_LEVER)
+    print()
+
     # F2 — nothing in this module can send. Structural assertion, not a promise.
+    #
+    # Asserted on the AST, not on the source TEXT. The regex this replaces matched the words
+    # "import send_queue" inside the integration-note COMMENT above log_attempt(), so a module
+    # that cannot send reported that it could — and the whole self-test exited 1 while printing
+    # PASS. A structural claim has to be checked against structure; prose defeats a substring
+    # match, which is the same trap case_tick's --live gate hit.
+    import ast as _ast
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    _send_mods = {"mer_send", "send_queue", "smtplib"}
+    _imported = set()
+    for _node in _ast.walk(_ast.parse(src)):
+        if isinstance(_node, _ast.Import):
+            _imported.update(a.name.split(".")[0] for a in _node.names)
+        elif isinstance(_node, _ast.ImportFrom) and _node.module:
+            _imported.add(_node.module.split(".")[0])
     check("F: Tier 0 has no send path (no smtp/mer_send/send_queue import)",
-          not re.search(r"import\s+(mer_send|send_queue|smtplib)", src))
+          not (_imported & _send_mods),
+          "real imports checked: %d" % len(_imported))
     print()
 
     print("--- sample RECORD-ONLY output (case B) " + "-" * 32)
@@ -1075,9 +1333,44 @@ def _selftest():
     return 0
 
 
+def _mark_cli(argv):
+    """M44: log an attempted lever from the command line. DRY RUN unless --live.
+
+        python3 remedy_map.py --mark-attempted --case CASE-1 --lever state_ag
+        python3 remedy_map.py --mark-attempted --case CASE-1 --lever state_ag --live
+
+    This is the HUMAN path — the levers a person pulls by hand (an AG portal submission, a
+    BBB complaint, a regulator form) leave no trace the engine can see, so somebody has to
+    say so. Levers the ENGINE pulls are logged automatically by send_queue.process() once
+    the send actually succeeds.
+
+    Exit 0 = logged (or already logged). Exit 2 = refused. Exit 3 = could not run.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(description="M14/M44 — log an attempted remedy lever")
+    ap.add_argument("--mark-attempted", action="store_true")
+    ap.add_argument("--case", required=True, help="case identifier, e.g. CASE-1")
+    ap.add_argument("--lever", required=True,
+                    help="lever key, e.g. state_ag / bbb / ftc / pre_suit_notice")
+    ap.add_argument("--live", action="store_true",
+                    help="actually write. Without this nothing is written.")
+    a = ap.parse_args(argv)
+    try:
+        v = log_attempt(a.case, a.lever, live=a.live)
+    except Exception as exc:
+        print("COULD NOT RUN (%s: %s). Nothing was written." % (type(exc).__name__, exc))
+        return 3
+    print(v["reason"])
+    if v["attempted"]:
+        print("  %s = %s" % (REMEDY_DONE_PROP, serialize(v["attempted"])))
+    return 2 if v["refused"] else 0
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
+    if "--mark-attempted" in sys.argv:
+        sys.exit(_mark_cli(sys.argv[1:]))
     # Bare execution is READ-ONLY: build maps for the live board and PRINT them. No writes.
     mc = _api()
     for it in mc.list_issues():

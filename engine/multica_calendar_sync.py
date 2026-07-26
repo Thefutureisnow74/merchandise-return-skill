@@ -33,12 +33,19 @@ for line in open(ENV):
         env[k.strip()] = v.strip().strip('"').strip("'")
 MTOK = env.get("MULTICA_TOKEN", "")
 MBASE = env.get("MULTICA_SERVER_URL", "https://api.multica.ai").rstrip("/") + "/api"
-# active workspaces (retired ones excluded on purpose)
-WORKSPACES = {
-    "Merchandise Return": env.get("MULTICA_WS_MERCHANDISE_RETURN", mer_config.multica_workspace_id()),
-    "AMBS Studio": env.get("MULTICA_WS_AMBS_STUDIO", "07f8ad67-25a2-4a68-aaf4-0a6d39d9f7f8"),
-    "Lisa Rebuild": env.get("MULTICA_WS_LISA_REBUILD", "e6f3bcf7-c265-4c0c-8f60-d3577f4ed09d"),
-}
+# Active workspaces (retired ones excluded on purpose).
+#
+# The user's OWN return workspace always syncs. Any EXTRA workspace is opt-in via env and has NO
+# default: these used to carry the author's private workspace UUIDs as hardcoded fallbacks, which
+# meant every stranger who installed the package received them. A workspace id is account-specific
+# — there is no sensible default for somebody else's board, so an unset var means "not mine, skip".
+WORKSPACES = {"Merchandise Return": mer_config.multica_workspace_id()}
+for _label, _var in (("AMBS Studio", "MULTICA_WS_AMBS_STUDIO"),
+                     ("Lisa Rebuild", "MULTICA_WS_LISA_REBUILD")):
+    _wsid = env.get(_var, "").strip()
+    if _wsid:
+        WORKSPACES[_label] = _wsid
+WORKSPACES = {k: v for k, v in WORKSPACES.items() if v}
 OPEN_EXCLUDE = {"done", "cancelled", "closed"}
 CAL_BASE = "https://www.googleapis.com/calendar/v3/calendars/%s/events" % urllib.parse.quote(CAL)
 

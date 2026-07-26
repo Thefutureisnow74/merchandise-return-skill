@@ -31,11 +31,11 @@ if __name__ == "__main__":
     doc = fitz.open()
     page = doc.new_page()
     page.insert_text((72, 72),
-                     "AMEX Assurance Company\nClaim 12393058\nOutcome: your refund request was "
+                     "Example Assurance Company\nClaim 10000001\nOutcome: your refund request was "
                      "DENIED - the claim was filed out of time.")
     data = doc.tobytes()
     doc.close()
     txt = extract_text(data)
     print("extracted:", repr(txt[:140]))
-    assert "DENIED" in txt and "12393058" in txt, "PDF EXTRACTION SELF-TEST FAILED"
+    assert "DENIED" in txt and "10000001" in txt, "PDF EXTRACTION SELF-TEST FAILED"
     print("PASS — fitz reads PDF attachments; a decision buried in a PDF is now visible to the classifier.")

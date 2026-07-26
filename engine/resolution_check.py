@@ -59,6 +59,11 @@ TRACE_WORDS = ("trace", "locate", "where the", "posted", "returned or held",
 
 # Affirmative grant patterns, per remedy. Each is a compiled regex over lowercase
 # text. They require a PERFECT/PAST outcome, not a promise.
+# A "non-sentence-breaking" character: anything but a period, EXCEPT a period that is part
+# of a decimal amount ("$75.00"). Plain `[^.]` treats the dot in a price as a full stop and
+# silently truncates the window before the verb ever arrives.
+_NB = r"(?:[^.]|\.(?=\d))"
+
 GRANTED_VERB = r"(?:has|have|is|are|was|were|been|we've|we have)\b[^.]{0,25}?" \
                r"(?:issued|processed|completed|refunded|credited|posted|sent|" \
                r"returned|reimbursed|approved and (?:sent|issued)|made)"
@@ -69,6 +74,17 @@ GRANT_PATTERNS = {
         re.compile(r"(you have been|you've been|has been) (refunded|reimbursed|credited)"),
         re.compile(r"(issued|processed|approved|completed) (a|your|the|this|full) (refund|reimbursement)"),
         re.compile(r"refund of \$?[\d,]+(?:\.\d{2})? (?:has|is|was) (?:been )?(?:issued|processed|completed|sent|credited)"),
+        # M44 — a STORE CREDIT grant. Two things the patterns above miss:
+        #   1. the instrument is named ("store credit", "gift card"), not "refund";
+        #   2. `[^.]` stops at the decimal point inside "$75.00", so "a store credit of
+        #      $75.00 has been issued" never reached its verb. _NB below lets a period
+        #      through only when a digit follows it, so a money amount does not read as
+        #      the end of the sentence while a real sentence boundary still does.
+        re.compile(r"(store credit|gift card|gift certificate|merchandise credit|"
+                   r"account credit|voucher|e-?gift)" + _NB + r"{0,40}?" + GRANTED_VERB),
+        re.compile(r"(store credit|gift card|gift certificate|merchandise credit|"
+                   r"account credit|voucher|e-?gift)" + _NB + r"{0,40}?"
+                   r"(?:has|have|was|were)\s+(?:been\s+)?(?:added|applied)"),
     ],
     "replacement": [
         re.compile(r"(replacement|replace\w*|new unit)\b[^.]{0,40}?"

@@ -67,6 +67,7 @@ CREATED, ADOPTED, SKIPPED, FAILED = "CREATED", "ADOPTED", "SKIPPED", "FAILED"
 #   MR Jurisdiction                                                          -> remedy map
 #   MR Discrimination Flag                                                   -> Tier 3-D
 #   MR Remedy Map / MR Remedy Attempted                                      -> the Tier4 gate
+#   MR Remedy Type                                            -> refund_landed / close_case
 # --------------------------------------------------------------------------------------
 PHASE_OPTIONS = [
     ("Intake",    "#6b7280"),
@@ -78,6 +79,15 @@ PHASE_OPTIONS = [
     ("PreSuit",   "#dc2626"),
     ("Tier4",     "#991b1b"),
     ("Closed",    "#22c55e"),
+]
+
+# M44 — the four remedies the ladder can actually win. The option NAMES are the contract
+# with refund_landed.normalize_remedy(); do not rename one without changing that mapping.
+REMEDY_TYPE_OPTIONS = [
+    ("Refund",      "#22c55e"),
+    ("Replacement", "#3b82f6"),
+    ("Repair",      "#f59e0b"),
+    ("StoreCredit", "#8b5cf6"),
 ]
 
 MR_SCHEMA = [
@@ -127,6 +137,18 @@ MR_SCHEMA = [
         "description": ("Tier 0 output: the comma/newline separated lever keys that apply to "
                         "THIS case (e.g. tier1_vendor, state_ag, bbb). case_tick FAILS CLOSED "
                         "at PreSuit -> Tier4 while this is empty."),
+    },
+    {
+        "name": "MR Remedy Type",
+        "type": "select",
+        "icon": "flag",
+        "options": REMEDY_TYPE_OPTIONS,
+        "description": ("Which remedy this case must prove LANDED before it may close: "
+                        "Refund (money posted), Replacement (item delivered), Repair (unit "
+                        "back AND verified working), StoreCredit (credit issued with a "
+                        "code). refund_landed/close_case FAIL CLOSED while this is blank — "
+                        "a ranked intake preference is not a decision and is never guessed. "
+                        "Set it to the remedy the vendor actually GRANTED."),
     },
     {
         "name": "MR Remedy Attempted",
@@ -747,7 +769,11 @@ def _selftest():
           % (len(board_created), c2.get(ADOPTED, 0)))
     check("re-run resolves the same workspace id", prof2["multica_workspace_id"] == prof["multica_workspace_id"])
 
-    # 3. KING'S CASE: a board that already has six of eight properties. Adopt 6, create 2.
+    # 3. THE PARTIAL BOARD: everything except the two Tier-4 gate properties already
+    #    exists. Adopt all of those, create exactly the two missing ones. The counts are
+    #    derived from MR_SCHEMA, never hardcoded — M44 added `MR Remedy Type` and a literal
+    #    "6" here would have failed for a reason that has nothing to do with the behaviour
+    #    under test.
     ws = {"id": "ws-king", "name": "Merchandise Return", "slug": "merchandise-return"}
     partial = [{"id": "p%d" % i, "name": s["name"], "type": s["type"],
                 "config": {"options": [{"id": "o%d" % j, "name": o[0], "color": o[1]}
@@ -757,8 +783,10 @@ def _selftest():
     (rep3, prof3), _ = _quiet(run, king, dict(_ANSWERS), True, os.path.join(tmp, "king.json"))
     p3 = rep3.actions_for("property")
     check("partial board adopts the workspace", rep3.actions_for("workspace").get("Merchandise Return") == ADOPTED)
-    check("partial board adopts the 6 existing properties",
-          sum(1 for v in p3.values() if v == ADOPTED) == 6, "adopted=%d" % sum(1 for v in p3.values() if v == ADOPTED))
+    n_pre_existing = len(MR_SCHEMA) - len(TIER4_GATE_PROPS)
+    check("partial board adopts the %d existing properties" % n_pre_existing,
+          sum(1 for v in p3.values() if v == ADOPTED) == n_pre_existing,
+          "adopted=%d" % sum(1 for v in p3.values() if v == ADOPTED))
     check("partial board creates ONLY the 2 Tier4 gate properties",
           [n for n, v in p3.items() if v == CREATED] == list(TIER4_GATE_PROPS),
           str([n for n, v in p3.items() if v == CREATED]))
