@@ -2,20 +2,16 @@
 name: merchandise-return
 description: >
   A complete, self-contained merchandise-return engine for a SINGLE user pursuing their OWN
-  refund/exchange/vendor-dispute — under their own name, email, phone, and accounts. The skill
-  runs the show end to end: it onboards the user (captures their identity profile and sets them
-  up on their OWN Multica board, helping them create an account if they don't have one), runs a
-  nationwide, jurisdiction-aware intake, builds a CASE-SPECIFIC remedy map (industry regulator,
-  governing state statute, civil-rights avenues, class-action/defect check), then escalates the
-  case up a multi-tier ladder (vendor → executives+public → researched regulators → conditional
-  civil-rights track → statutory pre-suit demand → chargeback/small-claims), using the user's own
-  Multica as the system of record and autopilot engine. It is built for a single person handling
-  their own return, in their own name — it collects only the user's own information. Packaged to be
-  handed to any person to run for themselves;
-  the recipient's Multica has nothing to do with anyone else's. Triggers on "start a return",
-  "open a return case", "get my money back from [vendor]", "escalate [vendor]", "send a letter to
-  [vendor]'s CEO", "where do we stand with my [case]". Runs in Claude Code, Telegram, and Multica.
-  Companion to active-case-log, vendor-dispute-investigation, and inbound-phishing-recognition.
+  refund/exchange/vendor-dispute — under their own name, email, phone, and accounts. Onboards the
+  user (identity, own Multica board), runs a jurisdiction-aware intake, builds a case-specific
+  remedy map (regulator, statute, civil-rights avenues, class-action check), escalates a multi-tier
+  ladder (vendor -> executives -> regulators -> conditional civil-rights track -> pre-suit demand ->
+  chargeback/small-claims) using the user's own Multica as system of record and autopilot. Own
+  name, own info only -- no representation, no client. Packaged for any recipient to run for
+  themselves. Triggers on "start a return", "get my money back from [vendor]", "escalate [vendor]",
+  "send a letter to [vendor]'s CEO", "where do we stand on my [case]". Runs in Claude Code,
+  OpenCode, Telegram, Multica. Companion: active-case-log, vendor-dispute-investigation,
+  inbound-phishing-recognition.
 ---
 
 # Merchandise Return — a single-user, self-run returns engine
@@ -106,15 +102,29 @@ every case inherits it.
 
 ## §1 — INTAKE (per case)
 
-Full questionnaire: `references/intake-questionnaire.md`. Every field is 🔴 BLOCKING or 🟡 parallel.
-Record answers as comments on the case's Multica issue; do not advance past CASE FILE until every 🔴
-is answered. The fields that sink cases when skipped:
+**Open and follow `references/intake-questionnaire.md` for the actual questioning — this section
+is a compression aid, not a substitute for it.** Every field there is 🔴 BLOCKING or 🟡 parallel;
+do not advance past CASE FILE until every 🔴 is answered. Record answers as comments on the case's
+Multica issue.
+
+⚠️ **Three questions are the spine of every intake and must always be asked, verbatim in spirit,
+even if you never open the reference file:**
+1. **What's actually wrong with the item or service — in the user's own words.** (§ref 3.1) Not
+   "from-start vs later" (that's a follow-up classifier, § ref 3.2) — the plain "tell me what
+   happened" question comes first and is easy to silently drop when working from a summary instead
+   of the full questionnaire. This was found missing from an earlier version of this very
+   compressed list on 2026-07-26.
+2. **What have they already tried — and WHO did they speak to, and WHEN?** (§ref 4.1, 4.3, 4.5,
+   4.6) Troubleshooting done, prior contact with the seller/manufacturer, named reps and what they
+   promised, and — critically — whether they reported it to anyone AT THE TIME it failed. That last
+   part is what turns a stale-looking case into one where the vendor was on notice from day one.
+3. **What outcome do they want — refund, replacement, repair, or credit, ranked if more than one?**
+   (§ref 5.1) The whole ladder is built backward from this. Never guess it.
+
+The rest of the fields that sink cases when skipped:
 - exact brand + model (+ size/capacity/variant), serial / IMEI / VIN
 - purchase date, exact amount paid, **how they paid** (chargeback path or not)
-- **defective-from-start vs failed-later** (the single most valuable question)
 - **damage history** — dropped / liquid / repaired / modified (ask directly and early)
-- desired outcome, ranked (refund / replacement / repair / credit)
-- prior contact + any existing case/RMA/claim numbers
 - **discrimination check** — *"Do you believe you were treated differently or unfairly because of
   your race, color, religion, sex, national origin, age, disability, or another protected
   characteristic? If yes — what specifically was said or done, by whom, and when?"* Capture the
