@@ -118,8 +118,11 @@ even if you never open the reference file:**
    4.6) Troubleshooting done, prior contact with the seller/manufacturer, named reps and what they
    promised, and — critically — whether they reported it to anyone AT THE TIME it failed. That last
    part is what turns a stale-looking case into one where the vendor was on notice from day one.
-3. **What outcome do they want — refund, replacement, repair, or credit, ranked if more than one?**
-   (§ref 5.1) The whole ladder is built backward from this. Never guess it.
+3. **What outcome do they want — refund, replacement, repair, or store credit, ranked if more
+   than one?** (§ref 5.1) The whole ladder is built backward from this. Never guess it. Use
+   "store credit" specifically, not a vague "credit" — it's one of the four `MR Remedy Type`
+   options the board tracks, and `refund_landed` requires a real code/card/certificate before a
+   store-credit case can close, not just the vendor's word that credit was issued.
 
 The rest of the fields that sink cases when skipped:
 - exact brand + model (+ size/capacity/variant), serial / IMEI / VIN

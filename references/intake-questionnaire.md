@@ -70,7 +70,7 @@ dispute.
 ## Section 5 — Desired outcome
 | # | Question | Priority | Why |
 |---|---|---|---|
-| 5.1 | What do you want — refund, replacement, repair, or credit? **Rank if more than one.** | 🔴 | The whole ladder is built backward from the ask; never guess |
+| 5.1 | What do you want — refund, replacement, repair, or store credit? **Rank if more than one.** | 🔴 | The whole ladder is built backward from the ask; never guess. Matches the board's `MR Remedy Type` options (Refund/Replacement/Repair/StoreCredit) exactly — a vague "credit" doesn't tell `refund_landed` what to verify before the case can close (store credit requires a real code/card/certificate, not just a promise) |
 | 5.2 | Any outcome you would NOT accept? | 🟡 | Prevents "winning" store credit they don't want |
 | 5.3 | Willing to escalate to regulators and, if needed, small claims? | 🔴 | **Ask up front.** If no, the ladder terminates at Tier 2 and everyone knows on day one |
 | 5.4 | A deadline or event that matters to you? | 🟡 | Affects pacing |
