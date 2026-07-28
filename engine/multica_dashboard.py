@@ -2,18 +2,24 @@
 """Build the 'Multica Dash Board' HTML message from live data and print it.
 Used by the Telegram `dashboard` / `/dashboard` command (and callable by Lisa).
 
-Reads the open-board snapshot from multica_state.json (schema 2: every needs-King
-item carries a King-Action packet {verb, detail, deadline, why, severity, blocking}),
+Reads the open-board snapshot from multica_state.json (schema 2: every needs-you
+item carries an action packet {verb, detail, deadline, why, severity, blocking}),
 plus today's Google Calendar and recently-done.
 
 FIXED CONTRACT — the whole point of this rewrite:
   • 🔴 CRITICAL / ONLY YOU items sort to the top by severity, then deadline.
   • Each 🔴 line is a COMPLETE instruction: verb → the specific artifact (address /
     amount / link) → deadline → why it blocks. No truncated titles, no "maybe".
-  • If a needs-King item has no detail, the line says "⚠️ detail missing — open MER-X"
+  • If a needs-you item has no detail, the line says "⚠️ detail missing — open MER-X"
     so the gap is LOUD, never silently dropped. That visibility is what gets it filled.
-Physical King-only actions (mail the shoes) can no longer sit in a soft "glance" bucket
-— the classifier promotes them to 🔴. This is the MER-2 fix."""
+Physical owner-only actions (mail the shoes) can no longer sit in a soft "glance" bucket
+— the classifier promotes them to 🔴. This is the MER-2 fix.
+
+NAMING (M47): the operator's name is out of the prose. Two things are deliberately NOT
+renamed, because they are contracts owned elsewhere: the snapshot keys `needs_king` /
+`king_action`, written by multica_board_state.py, and the literal `KING-ACTION:` block that
+the same module parses out of an issue description — the "detail missing" line below has to
+name the block a user is actually documented to write, or the advice would be wrong."""
 import json
 import os
 import sys
@@ -26,18 +32,55 @@ sys.path.insert(0, "/opt/data/scripts")
 import gmail_transport as _g  # noqa: E402
 import mer_config             # noqa: E402  (M32 — identity comes from the profile, not a literal)
 
-ENV = "/opt/data/.env"
 STATE = "/opt/data/multica_state.json"
 CT = timezone(timedelta(hours=-5))
 
-env = {}
-for line in open(ENV):
-    s = line.strip()
-    if s and not s.startswith("#") and "=" in s:
-        k, v = s.split("=", 1)
-        env[k.strip()] = v.strip().strip('"').strip("'")
-MTOK = env.get("MULTICA_TOKEN", "")
-MBASE = env.get("MULTICA_SERVER_URL", "https://api.multica.ai").rstrip("/") + "/api"
+# ---------------------------------------------------------------------------------------------
+# CONFIG — ordered lookup, never an unconditional read of a container path.
+#
+# This module used to do `for line in open("/opt/data/.env")` at IMPORT time. On the VPS that is
+# fine; anywhere else — a laptop, CI, or a stranger's install of the packaged skill — it raised
+# FileNotFoundError before a single line of the module body ran, so the dashboard could not be
+# imported, tested, or shipped. Same precedence idea as mer_config: an explicit override, then a
+# file if one happens to exist, then nothing (and the failure surfaces at the HTTP call, with a
+# real message, instead of at import).
+#
+# Order, first hit wins:
+#   1. the process environment ($MULTICA_TOKEN / $MULTICA_SERVER_URL)
+#   2. a .env file — $MER_ENV_FILE, else the container default, else one beside this script
+#   3. "" (token) / the public API (base url)
+# ---------------------------------------------------------------------------------------------
+ENV_PATHS = [p for p in (os.environ.get("MER_ENV_FILE"),
+                         "/opt/data/.env",
+                         os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")) if p]
+
+
+def _load_env_file():
+    """Parse the first readable .env on ENV_PATHS. Missing/unreadable is NORMAL off the VPS."""
+    for path in ENV_PATHS:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                out = {}
+                for line in fh:
+                    s = line.strip()
+                    if s and not s.startswith("#") and "=" in s:
+                        k, v = s.split("=", 1)
+                        out[k.strip()] = v.strip().strip('"').strip("'")
+                return out
+        except OSError:
+            continue
+    return {}
+
+
+env = _load_env_file()
+
+
+def _conf(name, default=""):
+    return (os.environ.get(name) or env.get(name) or default)
+
+
+MTOK = _conf("MULTICA_TOKEN", "")
+MBASE = _conf("MULTICA_SERVER_URL", "https://api.multica.ai").rstrip("/") + "/api"
 
 SEV_RANK = {"critical": 0, "high": 1, "normal": 2, None: 3}
 
@@ -125,7 +168,7 @@ def recently_done(workspaces):
     return done[:4]
 
 
-def render_king_line(i):
+def render_action_line(i):
     """A COMPLETE, self-contained instruction. verb → detail → deadline → why."""
     a = i.get("king_action") or {}
     ident = i.get("identifier") or "?"
@@ -183,11 +226,11 @@ def main():
     if critical:
         L.append("\U0001f534 <b>CRITICAL — DO THESE FIRST</b>")
         for i in critical:
-            L.append(render_king_line(i))
+            L.append(render_action_line(i))
     if other_king:
         L.append("\n\U0001f7e0 <b>NEEDS YOU</b>")
         for i in other_king:
-            L.append(render_king_line(i))
+            L.append(render_action_line(i))
     if review:
         L.append("\n⚠️ <b>MIGHT NEED YOU</b> (glance)")
         for i in review:

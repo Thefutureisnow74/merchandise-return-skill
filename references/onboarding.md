@@ -1,6 +1,6 @@
 # Onboarding — what actually happens (Blueprint M35)
 
-This is the implemented flow. Everything below is done by **`scripts/vps/onboard.py`**, not by
+This is the implemented flow. Everything below is done by **`engine/onboard.py`**, not by
 a person following a checklist. Before M35, §0 was a description with no code behind it: nothing
 provisioned a workspace, nothing created a project, and **nothing created the MR property schema**.
 
@@ -13,13 +13,16 @@ provisioned a workspace, nothing created a project, and **nothing created the MR
 
 ## Run it
 
+All engine code ships in **`engine/`**. Run these from that directory.
+
 ```bash
+cd engine
 export MULTICA_TOKEN=<your token>          # from ~/.multica/config.json after `multica login`
-python3 onboard.py                         # interactive interview, DRY RUN — writes nothing
-python3 onboard.py --live                  # interactive interview, actually provisions
-python3 onboard.py --answers answers.json  # non-interactive plan, DRY RUN
-python3 onboard.py --answers answers.json --live --out ./profile.json
-python3 onboard.py --selftest              # offline proof, stubbed API, no network
+python onboard.py                         # interactive interview, DRY RUN — writes nothing
+python onboard.py --live                  # interactive interview, actually provisions
+python onboard.py --answers answers.json  # non-interactive plan, DRY RUN
+python onboard.py --answers answers.json --live --out ./profile.json
+python onboard.py --selftest              # offline proof, stubbed API, no network
 ```
 
 | Flag | Meaning |
@@ -88,10 +91,26 @@ completely different property ids but behaves identically. **Never rename one to
 | `MR Jurisdiction` | text | remedy mapping (Tier 0) |
 | `MR Discrimination Flag` | checkbox | the Tier 3-D civil-rights track |
 | `MR Remedy Map` | text | **the Tier4 gate** — comma/newline separated lever keys |
+| `MR Remedy Type` | select — `Refund, Replacement, Repair, StoreCredit` | `refund_landed` / `close_case` — **the remedy the vendor ACTUALLY GRANTED**, never the user's ranked preference. Blank until a vendor grants something; both modules fail closed while blank. The user's ranked ask lives in the intake comment. |
 | `MR Remedy Attempted` | text | **the Tier4 gate** — levers actually done AND logged |
+
+That is **nine** properties. `onboard.py`'s own header text still says "eight" — a stale count in a
+comment, not a missing property.
 
 `MR Remedy Map` / `MR Remedy Attempted` are the two that decide whether the ladder can reach
 court. `case_tick` fails closed while either is empty.
+
+> ⚠️ **Three properties the engine uses are NOT created by `onboard.py`.** Create them by hand on
+> the board, with these exact names and types, or the features that read them silently do nothing:
+>
+> | Property | Type | Used by |
+> |---|---|---|
+> | `MR Last Vendor Reply` | date | Written by `mer_engine` on every substantive inbound vendor reply; read by `case_tick`'s escalation-hold gate, so the ladder does not escalate over a vendor who is answering. |
+> | `MR Delay Explanation` | text | The §1.6 delay narrative, verbatim. Until it exists, record the explanation as a `RECORD ONLY` comment and say the property is missing. |
+> | `MR Money Parties` | text | The money path (`references/money-trail.md`). |
+>
+> Writing them is the same command as any other property:
+> `python multica_api.py --set MER-76 "MR Delay Explanation=@note.txt"`
 
 ### Idempotency
 

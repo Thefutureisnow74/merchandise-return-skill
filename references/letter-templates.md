@@ -1,5 +1,10 @@
 # Letter Templates — parameterized, ready-to-fill
 
+> **Not legal advice.** These templates apply published consumer rules to facts the USER supplies,
+> and go out over the **user's own signature**. Every statutory citation must be verified live before
+> it goes in a letter. For a signed arbitration agreement, a counter-claim, or an amount that
+> matters, the user should talk to an attorney.
+
 Every outbound the ladder sends starts from a template here, not a blank page. Fill the
 `{{placeholders}}` from the case's Multica issue, then let the autonomy lane (SKILL.md §5) decide
 whether it auto-sends after a veto window (🟡) or waits for the user's explicit YES (🔴).
@@ -85,7 +90,7 @@ context; a delay repeated anxiously reads as a weakness the vendor will aim at.
 
 ## 1. Tier 1 — Vendor demand
 
-*First contact. Seller and manufacturer get this in parallel where both apply. 7-business-day SLA,
+*First contact. Seller and manufacturer get this in parallel where both apply. 5-business-day SLA,
 Day-3 nudge. Lane 🔴 (new vendor) → user YES on first send. One factual paragraph on the defect;
 cites purchase date, amount, and card last-4 so the vendor can find the transaction instantly.*
 
@@ -156,7 +161,7 @@ Dear {{exec_name}},
 I am escalating a matter your customer-care team has not resolved. On {{prior_letter_date}} I
 sent {{vendor}} a written request regarding a defective {{item}} ({{model}}, serial {{serial}}),
 purchased {{purchase_date}} for {{amount}} (order {{order_number}}). That message
-(ref {{prior_message_id}}) set a 7-business-day deadline, which has now passed without a
+(ref {{prior_message_id}}) set a 5-business-day deadline, which has now passed without a
 substantive response.
 
 The facts are undisputed: the product {{defect}}. A product sold for ordinary use carries an
@@ -209,7 +214,7 @@ TIMELINE OF WHAT I DID
   e.g.
   - {{purchase_date}} — purchased {{item}}.
   - {{prior_letter_date}} — wrote {{vendor}} customer care requesting a {{desired_outcome}}
-    (7-business-day deadline). No substantive response.
+    (5-business-day deadline). No substantive response.
   - [date] — escalated in writing to {{exec_name}}/legal. No resolution.
 
 WHAT I HAVE TRIED
@@ -308,8 +313,15 @@ Sent {{today_date}} via certified mail, return receipt requested.
 
 ### 5c. Generic fallback (state without a specific pre-suit statute)
 
-*Use where `jurisdiction-lookup.md` shows no mandatory pre-suit notice, or "Verify". Still cites the
-state UDAP act + implied warranty, still gives a firm deadline, still preserves the paper trail.*
+*Use ONLY where `jurisdiction-lookup.md` shows **no** mandatory pre-suit notice for the user's state.*
+
+> 🛑 **A "Verify" row is a STOP, not a green light.** "Verify" means *go check the current rule
+> live* — 40+ states are marked that way, and a missed mandatory pre-suit notice **can bar the
+> lawsuit entirely**. Resolve the state's actual requirement before sending this template. If a
+> mandatory notice turns out to exist, use 5a/5b (the statutory form), not this one.
+
+*Still cites the state UDAP act + implied warranty, still gives a firm deadline, still preserves the
+paper trail.*
 
 ```
 Subject: FINAL PRE-LITIGATION DEMAND — {{name}} / {{item}}
@@ -325,8 +337,8 @@ merchantability and {{statute}}. I requested a remedy on {{prior_letter_date}}
 (ref {{prior_message_id}}); it remains unresolved.
 
 I demand a {{desired_outcome}} of {{amount}} within 14 days of this letter. If I do not receive
-it, I intend to pursue the remedies available to me, including a small-claims filing and a
-complaint to the appropriate regulator. I would rather resolve this directly.
+it, I intend to pursue the remedies available to me, including a small-claims filing. I would
+rather resolve this directly.
 
 {{name}}
 {{email}} · {{phone}}
@@ -338,16 +350,28 @@ Sent {{today_date}}.
 > the vendor's **receipt** — log the send date and the delivery proof on the issue, and start the
 > §17.505 / §1782 clock from receipt, not from drafting.
 
+> 🛑 **Never price a regulator complaint or publicity.** A demand may state that the user intends to
+> **sue** if not paid by a date — that is lawful and normal. A demand may **never** offer to withhold
+> a **regulatory filing, a BBB complaint, media contact, or a public post** in exchange for payment;
+> that is the classic shape of coercion. Regulator complaints are filed on their merits and
+> **announced, never bargained**. Do not add such a clause back into any template here, and strike it
+> if a drafted letter contains one.
+
 ---
 
 ## Filling & sending checklist (applies to every template)
 
 1. **Resolve the statute/agency/venue at Tier 0** — `jurisdiction-lookup.md`, never assume a state.
-2. **Compute `{{deadline_date}}` as a real calendar date** from business days and sanity-check it
-   (SKILL.md §6.3 — the repeated "7 business days from a Friday ≠ +7 calendar days" error).
+2. **Compute `{{deadline_date}}` as a real calendar date** using `engine/businessday.py` and
+   sanity-check it (SKILL.md §6.3 — "5 business days from a Friday" ≠ "+5 calendar days"). The
+   Tier-1 window is **5 business days** everywhere in this package; never write 7.
 3. **No unfilled `{{token}}` may remain** in the body at send time.
-4. **Pass the idempotency guard before sending** — `idempotency.reserve(case, action, recipient,
-   body)` (SKILL.md §6.6). This is what makes the 2026-07-18 double-send structurally impossible.
+4. **Send only through `mer_send.send()`** (SKILL.md §6.10). It reserves the send, mints the
+   single-use token the transport now demands, and enforces the 48-hour `(case, recipient)` cooldown.
+   Calling `gmail_transport.send_mime` directly raises.
+4b. **Never build a letter through a shell literal.** Write the body to a file and pass it by path.
+   `$2,500` does not survive shell interpolation, and a mangled amount is a factual error over the
+   user's signature.
 5. **Honor the autonomy lane** — 🟡 auto-send after the veto window; 🔴 wait for the user's YES.
 6. **Log the send** as an `EVENT:` line + a `RECORD ONLY` comment on the case, and capture the
    outbound Message-ID so the next tier can reference it as `{{prior_message_id}}`.

@@ -1479,25 +1479,53 @@ def selftest(out=None):
               BLOCK_BEGIN % a.tag in store["text"] and BLOCK_BEGIN % b.tag in store["text"])
 
         # ------------------------------------------------------------------ 7. Windows schtasks
+        #
+        # DERIVE EVERY EXPECTED VALUE FROM THE MANIFEST — never hardcode one here.
+        # Until 2026-07-28 these checks pinned MANIFEST DATA in CODE: they asserted the
+        # literals "\\ta\\mer-sol-watchdog-1000" and "/ST 10:00". mer-sol-watchdog moved
+        # from 10:00 to 15:00 UTC that day and two checks went red — a schedule change,
+        # not a regression, turned the whole suite RED and told nobody anything true.
+        # The property worth testing is the CONVENTION (namespaced \<tag>\<job>-HHMM, /ST
+        # HH:MM, WEEKLY + /D <dow> when the expression restricts weekdays, one task per
+        # firing time), so the expected values are computed from the job's own cron
+        # expression. Change the schedule in schedule.json.example and this stays green;
+        # break the naming or expansion rule and it goes red.
         calls = []
         st = SchtasksBackend(runner=lambda argv: (calls.append(argv), (0, "", ""))[1])
-        d5, p5 = st.plan_install([m.get("mer-sol-watchdog")], a)
-        check("schtasks creates one task for a weekly job", len(p5) == 1)
+        wd_job = m.get("mer-sol-watchdog")
+        wd_times = wd_job.cron.times()
+        wd_dows = wd_job.cron.weekdays()
+        d5, p5 = st.plan_install([wd_job], a)
+        check("schtasks creates one task per firing time for a weekly job",
+              len(p5) == len(wd_times), "%d task(s) for %d time(s)" % (len(p5), len(wd_times)))
         argv = p5[0]
+        wd_h, wd_m = wd_times[0]
         check("schtasks task name is namespaced and deterministic",
-              argv[argv.index("/TN") + 1] == "\\ta\\mer-sol-watchdog-1000",
+              argv[argv.index("/TN") + 1] == "\\%s\\%s-%02d%02d" % (a.tag, wd_job.name, wd_h, wd_m),
               argv[argv.index("/TN") + 1])
         check("schtasks uses WEEKLY for a weekday-restricted job",
               argv[argv.index("/SC") + 1] == "WEEKLY")
-        check("schtasks names the weekday", argv[argv.index("/D") + 1] == "MON")
-        check("schtasks sets the start time", argv[argv.index("/ST") + 1] == "10:00")
+        check("schtasks names the weekday",
+              argv[argv.index("/D") + 1] == SchtasksBackend._DOW[wd_dows[0]],
+              argv[argv.index("/D") + 1])
+        check("schtasks sets the start time from the manifest",
+              argv[argv.index("/ST") + 1] == "%02d:%02d" % (wd_h, wd_m),
+              argv[argv.index("/ST") + 1])
         check("schtasks forces overwrite so re-install cannot duplicate", "/F" in argv)
-        d6, p6 = st.plan_install([m.get("mer-delivery-check")], a)
-        check("schtasks expands an hour list into one task per time", len(p6) == 3)
+        dc_job = m.get("mer-delivery-check")
+        d6, p6 = st.plan_install([dc_job], a)
+        check("schtasks expands an hour list into one task per time",
+              len(p6) == len(dc_job.cron.times()),
+              "%d task(s) for %d time(s)" % (len(p6), len(dc_job.cron.times())))
+        check("the hour-list job really does fire more than once a day (else the check above "
+              "proves nothing)", len(dc_job.cron.times()) > 1)
         check("schtasks uses DAILY when no weekday restriction",
               p6[0][p6[0].index("/SC") + 1] == "DAILY")
-        d7, p7 = st.plan_install([m.get("mer-engine")], a)
-        check("schtasks handles the 10-hour business-day job", len(p7) == 10)
+        eng_job = m.get("mer-engine")
+        d7, p7 = st.plan_install([eng_job], a)
+        check("schtasks handles the multi-hour business-day job",
+              len(p7) == len(eng_job.cron.times()),
+              "%d task(s) for %d time(s)" % (len(p7), len(eng_job.cron.times())))
         names = [x[x.index("/TN") + 1] for x in p7]
         check("schtasks task names are unique", len(set(names)) == len(names))
         d8, p8 = st.plan_uninstall([m.get("mer-engine")], a)

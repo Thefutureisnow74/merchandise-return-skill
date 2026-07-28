@@ -1,16 +1,52 @@
 #!/usr/bin/env python3
 """
-send_queue.py — the veto-window queue for autonomous outbound (M6/M7).
+send_queue.py — the veto-window queue for autonomous outbound (M6/M7, hardened M45).
 
 The engine never sends instantly. It ENQUEUES a drafted send with a `send_after` time; the user
 gets the queued item surfaced and can veto during the window. `process()` fires everything whose
-window has elapsed and that wasn't vetoed, via mer_send (which honors MER_ENGINE_SEND: off/test/live)
-and the idempotency guard.
+window has elapsed and that wasn't vetoed, via mer_send (which honors MER_ENGINE_SEND:
+off/test/veto/live) and the idempotency guard.
 
-Record: {id, case, to, subject, body, action, send_after(iso), in_reply_to, references, vetoed}
-Queue file: /opt/data/mer_send_queue.json
+Record: {id, case, to, subject, body, action, send_after(iso), in_reply_to, references, vetoed,
+         lever, attempts, last_error, last_attempt_at, next_attempt_at, stale, needs_redraft}
+Queue file: /opt/data/mer_send_queue.json          (env MER_SEND_QUEUE)
+Dead letters: mer_send_dead.json beside it         (env MER_SEND_DEAD)
 
-CLI: --list | --process | --veto <id> | --enqueue-test
+CLI: --list | --process | --veto <id> | --enqueue-test | --dead | --requeue <id> | --selftest
+
+--------------------------------------------------------------------------------------------
+M45 — WHAT CHANGED AND WHY
+--------------------------------------------------------------------------------------------
+* NOTHING IS EVER DROPPED ON AN ERROR PATH.  process() used to retain a record only when the
+  reason string contained "sending disabled"; an SMTP error, an auth failure or an idempotency
+  block fell straight through to _save(keep) and the letter simply ceased to exist — no queue
+  entry, no ledger entry, no alert, nobody knew. Now every non-sent outcome is classified:
+  HOLD (retry later, no attempt burned), RETRY (attempts+1 with exponential backoff), or
+  DEAD (moved to the dead-letter file, which is a durable record, not a deletion).
+
+* VETOES ARE PERSISTED.  A vetoed record was dropped from disk and recorded nowhere, so
+  case_tick at 09:00 the next morning found no live queue record and no ledger entry and
+  re-enqueued the identical letter. Every single day. veto() now calls
+  idempotency.record_veto(case, action); nudge/case_tick consult idempotency.was_vetoed().
+
+* THE STATE FILE FAILS CLOSED.  _load() was `except Exception: return []`, so a corrupt queue
+  silently became an empty queue and the very next _save() made that erasure permanent. A
+  MISSING file is still fine (cold start); a PRESENT-but-unreadable one now raises.
+
+* _save() IS ATOMIC AND PERMISSION-STABLE.  It was a plain truncating open(), so a crash
+  mid-write left a half-written queue. It now uses the same mkstemp + chmod 0664 + os.replace
+  path as the ledger (the chmod matters: mkstemp is 0600 owned by the writing uid, and the
+  jobs run as a mix of root and hermes).
+
+* LOCKING.  _load/_save run under an flock, so the every-minute hotpath cannot interleave with
+  the hourly engine draining the queue. The lock is NOT held across the send itself — that
+  would serialize the network and deadlock nothing useful — only across the state I/O.
+
+* STALE BACKLOG GUARD.  A letter whose send_after is more than MER_SEND_MAX_AGE_HOURS in the
+  past is never sent. It is flagged needs_redraft and left visible. This is the guard against
+  a pile of letters accumulating under a misconfigured mode and then all blasting out at once
+  when somebody flips MER_ENGINE_SEND to live — an old letter quoting an expired deadline is
+  worse than no letter.
 """
 import json
 import os
@@ -20,20 +56,98 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/data/scripts")
+import idempotency  # noqa: E402
 import mer_send  # noqa: E402
 
 QUEUE = os.environ.get("MER_SEND_QUEUE", "/opt/data/mer_send_queue.json")
 
+#: Retry policy for a record whose send genuinely errored (SMTP down, auth blip, transport
+#: exception). Exponential: BASE, 2*BASE, 4*BASE ... capped, then the record goes dead-letter.
+MAX_ATTEMPTS = int(os.environ.get("MER_SEND_MAX_ATTEMPTS", "5"))
+RETRY_BASE_MINUTES = int(os.environ.get("MER_SEND_RETRY_BASE_MIN", "15"))
+RETRY_CAP_MINUTES = int(os.environ.get("MER_SEND_RETRY_CAP_MIN", "360"))
+
+#: A letter this far past its send_after is stale: do not send, flag for redraft.
+MAX_SEND_AGE_HOURS = float(os.environ.get("MER_SEND_MAX_AGE_HOURS", "24"))
+
+#: Reason substrings that mean "not an error, just not now" — hold the record, burn no attempt.
+HOLD_MARKERS = ("sending disabled", "a direct send is refused")
+
+
+class QueueCorrupt(RuntimeError):
+    """The queue file exists but could not be read. NEVER treated as an empty queue."""
+
+
+def _dead_path():
+    env = os.environ.get("MER_SEND_DEAD")
+    if env:
+        return env
+    return os.path.join(os.path.dirname(QUEUE) or ".", "mer_send_dead.json")
+
 
 def _load():
-    try:
-        return json.load(open(QUEUE))
-    except Exception:
-        return []
+    """list — the queue. Absent file is an empty queue; corrupt file raises QueueCorrupt."""
+    with idempotency.file_lock(QUEUE):
+        try:
+            return idempotency._read_json(QUEUE, [])
+        except idempotency.LedgerCorrupt as e:
+            raise QueueCorrupt(str(e).replace("duplicate-send history",
+                                              "queued outbound letters"))
 
 
 def _save(q):
-    json.dump(q, open(QUEUE, "w"), indent=2)
+    """Atomic + permission-stable + locked. Keeps the previous good version at <queue>.bak."""
+    with idempotency.file_lock(QUEUE):
+        idempotency._write_json(QUEUE, list(q))
+
+
+def dead_letters():
+    """list — records process() refused to keep retrying. A durable record, not a deletion."""
+    path = _dead_path()
+    with idempotency.file_lock(path):
+        try:
+            return idempotency._read_json(path, [])
+        except idempotency.LedgerCorrupt as e:
+            raise QueueCorrupt(str(e))
+
+
+def _dead_letter(rec, reason):
+    """Move a record out of the live queue WITHOUT losing it."""
+    path = _dead_path()
+    rec = dict(rec)
+    rec["dead_reason"] = reason
+    rec["dead_at"] = datetime.now(timezone.utc).isoformat()
+    with idempotency.file_lock(path):
+        try:
+            cur = idempotency._read_json(path, [])
+        except idempotency.LedgerCorrupt:
+            raise
+        cur.append(rec)
+        idempotency._write_json(path, cur)
+    return rec
+
+
+def requeue_dead(rec_id, window_hours=0):
+    """Pull one dead letter back into the live queue with a fresh window. Human-driven."""
+    path = _dead_path()
+    with idempotency.file_lock(path):
+        cur = idempotency._read_json(path, [])
+        hit = [r for r in cur if r.get("id") == rec_id]
+        if not hit:
+            return False
+        rest = [r for r in cur if r.get("id") != rec_id]
+        idempotency._write_json(path, rest)
+    r = dict(hit[0])
+    for k in ("dead_reason", "dead_at", "attempts", "last_error",
+              "last_attempt_at", "next_attempt_at", "stale", "needs_redraft"):
+        r.pop(k, None)
+    r["send_after"] = (datetime.now(timezone.utc)
+                       + timedelta(hours=window_hours)).isoformat()
+    r["vetoed"] = False
+    q = _load()
+    q.append(r)
+    _save(q)
+    return True
 
 
 def enqueue(case, to, subject, body, action="reply", window_hours=3,
@@ -57,6 +171,7 @@ def enqueue(case, to, subject, body, action="reply", window_hours=3,
         "queued_at": datetime.now(timezone.utc).isoformat(),
         "send_after": (datetime.now(timezone.utc) + timedelta(hours=window_hours)).isoformat(),
         "vetoed": False,
+        "attempts": 0, "last_error": None, "last_attempt_at": None, "next_attempt_at": None,
     }
     q.append(rec)
     _save(q)
@@ -64,57 +179,154 @@ def enqueue(case, to, subject, body, action="reply", window_hours=3,
 
 
 def veto(rec_id):
+    """Veto a queued letter AND remember that it was vetoed.
+
+    The remembering is the whole M45 fix. Dropping the record was correct; dropping it as the
+    ONLY trace was not — the next tick had no way to tell "the user said no" from "nothing was
+    ever drafted", so it redrafted the identical letter the following morning, and the morning
+    after that. idempotency.was_vetoed(case, action) is the durable answer.
+    """
     q = _load()
     hit = False
     for r in q:
         if r["id"] == rec_id:
             r["vetoed"] = True
             hit = True
-    _save(q)
+            idempotency.record_veto(
+                r.get("case", ""), r.get("action", "reply"),
+                meta={"queue_id": rec_id, "to": r.get("to"), "subject": r.get("subject"),
+                      "lever": r.get("lever")})
+    if hit:
+        _save(q)
     return hit
 
 
+def _backoff_minutes(attempts):
+    return min(RETRY_BASE_MINUTES * (2 ** max(0, attempts - 1)), RETRY_CAP_MINUTES)
+
+
+def _parse_ts(value, fallback):
+    try:
+        d = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return fallback
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
 def process():
+    """Drain the queue. Returns a list of (id, case, outcome) rows.
+
+    INVARIANT (M45): a record leaves the live queue for exactly three reasons — it sent, it was
+    vetoed (and the veto is persisted), or it was moved to the dead-letter file. There is no
+    path on which a letter is silently forgotten.
+    """
     now = datetime.now(timezone.utc)
     q = _load()
     keep, fired = [], []
     for r in q:
+        rid, rcase = r.get("id"), r.get("case")
+
         if r.get("vetoed"):
-            fired.append((r["id"], r["case"], "VETOED — dropped, not sent"))
+            idempotency.record_veto(rcase or "", r.get("action", "reply"),
+                                    meta={"queue_id": rid, "to": r.get("to"),
+                                          "subject": r.get("subject")})
+            fired.append((rid, rcase, "VETOED — dropped, not sent (veto recorded durably)"))
             continue
-        try:
-            sa = datetime.fromisoformat(r["send_after"])
-        except Exception:
-            sa = now
+
+        sa = _parse_ts(r.get("send_after"), now)
         if sa > now:
             keep.append(r)
-            fired.append((r["id"], r["case"], "counting down — sends %s" % r["send_after"]))
+            fired.append((rid, rcase, "counting down — sends %s" % r.get("send_after")))
             continue
-        res = mer_send.send(r["to"], r["subject"], r["body"], case=r.get("case", ""),
-                            action=r.get("action", "reply"),
-                            in_reply_to=r.get("in_reply_to"), references=r.get("references"))
-        fired.append((r["id"], r["case"], res))
-        if res.get("sent") and r.get("lever"):
-            # M44 — THE CALL SITE `remedy_map.mark_attempted` never had. A lever counts as
-            # attempted only when the letter genuinely left, which is exactly here: after
-            # the veto window closed, after idempotency cleared, after the transport
-            # returned an id. Best-effort and non-fatal by design — the mail is already
-            # gone, so a board hiccup must not be reported as a failed send. A missed log
-            # leaves Tier 4 shut, which is the safe direction; the human path
-            # (`remedy_map.py --mark-attempted --live`) closes the gap.
-            try:
-                import remedy_map
-                lv = remedy_map.log_attempt(r["case"], r["lever"], live=True)
-                fired.append((r["id"], r["case"], "lever-log: %s" % lv["reason"]))
-            except Exception as e:
-                fired.append((r["id"], r["case"],
-                              "lever-log FAILED for %r (%s) — the send DID go out; log it "
-                              "by hand with: remedy_map.py --mark-attempted --case %s "
-                              "--lever %s --live" % (r["lever"], e, r["case"], r["lever"])))
-        # keep it queued ONLY if sending is globally disabled (so it fires once enabled);
-        # otherwise it's done (sent, idempotency-blocked, or errored — don't loop forever).
-        if not res.get("sent") and "sending disabled" in res.get("reason", ""):
+
+        # STALE BACKLOG GUARD — never let an old letter fire just because someone flipped a mode.
+        age_h = (now - sa).total_seconds() / 3600.0
+        if MAX_SEND_AGE_HOURS and age_h > MAX_SEND_AGE_HOURS and not r.get("attempts"):
+            r["stale"] = True
+            r["needs_redraft"] = True
             keep.append(r)
+            fired.append((rid, rcase,
+                          "STALE (%.1fh past its window, max %.1fh) — NOT sent; flagged "
+                          "needs_redraft. An old letter quoting a dead deadline is worse than "
+                          "no letter. Redraft it or --requeue after redrafting."
+                          % (age_h, MAX_SEND_AGE_HOURS)))
+            continue
+
+        nxt = r.get("next_attempt_at")
+        if nxt and _parse_ts(nxt, now) > now:
+            keep.append(r)
+            fired.append((rid, rcase, "backing off after %d attempt(s) — retries %s (last error: %s)"
+                          % (r.get("attempts", 0), nxt, r.get("last_error"))))
+            continue
+
+        try:
+            res = mer_send.send(r["to"], r["subject"], r["body"], case=r.get("case", ""),
+                                action=r.get("action", "reply"),
+                                in_reply_to=r.get("in_reply_to"),
+                                references=r.get("references"),
+                                via_queue=True)
+        except Exception as e:
+            # mer_send documents "never raises", but a ModeError / import-time surprise must
+            # not take the whole drain down and must not lose this record.
+            res = {"sent": False, "reason": "send primitive raised: %s: %s"
+                   % (type(e).__name__, e)}
+        fired.append((rid, rcase, res))
+
+        if res.get("sent"):
+            if r.get("lever"):
+                # M44 — THE CALL SITE `remedy_map.mark_attempted` never had. A lever counts as
+                # attempted only when the letter genuinely left, which is exactly here: after
+                # the veto window closed, after idempotency cleared, after the transport
+                # returned an id. Best-effort and non-fatal by design — the mail is already
+                # gone, so a board hiccup must not be reported as a failed send. A missed log
+                # leaves Tier 4 shut, which is the safe direction; the human path
+                # (`remedy_map.py --mark-attempted --live`) closes the gap.
+                try:
+                    import remedy_map
+                    lv = remedy_map.log_attempt(r["case"], r["lever"], live=True)
+                    fired.append((rid, rcase, "lever-log: %s" % lv["reason"]))
+                except Exception as e:
+                    fired.append((rid, rcase,
+                                  "lever-log FAILED for %r (%s) — the send DID go out; log it "
+                                  "by hand with: remedy_map.py --mark-attempted --case %s "
+                                  "--lever %s --live" % (r["lever"], e, r["case"], r["lever"])))
+            continue  # sent: done, drop from the live queue
+
+        reason = str(res.get("reason", ""))
+
+        # (a) HOLD — sending is globally off, or veto mode refused a non-queue call. Not an
+        #     error, nothing to retry, no attempt burned: keep it so it fires once enabled.
+        if any(m in reason for m in HOLD_MARKERS):
+            keep.append(r)
+            continue
+
+        # (b) TERMINAL, NON-ERROR — the guard says this letter must not go: it already went
+        #     (exact key), or a letter to this vendor on this case went inside the cooldown.
+        #     Dropping it silently is what used to happen; it goes to dead letters instead so a
+        #     human can see the engine tried and why it was refused.
+        if reason.startswith("idempotency:"):
+            r["last_error"] = reason
+            _dead_letter(r, "blocked by the send guard: %s" % reason)
+            fired.append((rid, rcase, "moved to dead letters (send guard refused it) — "
+                                      "review with `send_queue.py --dead`"))
+            continue
+
+        # (c) ERROR — retry with backoff, then dead-letter. NEVER discard.
+        r["attempts"] = int(r.get("attempts") or 0) + 1
+        r["last_error"] = reason
+        r["last_attempt_at"] = now.isoformat()
+        if r["attempts"] >= MAX_ATTEMPTS:
+            r["next_attempt_at"] = None
+            _dead_letter(r, "failed %d attempts; last error: %s" % (r["attempts"], reason))
+            fired.append((rid, rcase, "DEAD-LETTERED after %d attempts — NOT lost, see "
+                                      "`send_queue.py --dead`" % r["attempts"]))
+            continue
+        wait = _backoff_minutes(r["attempts"])
+        r["next_attempt_at"] = (now + timedelta(minutes=wait)).isoformat()
+        keep.append(r)
+        fired.append((rid, rcase, "attempt %d/%d failed, retrying in %dm"
+                      % (r["attempts"], MAX_ATTEMPTS, wait)))
+
     _save(keep)
     return fired
 
@@ -138,6 +350,8 @@ def _selftest():
     live_queue = "/opt/data/mer_send_queue.json"
     tmpdir = tempfile.mkdtemp(prefix="send_queue_test_")
     QUEUE = os.path.join(tmpdir, "queue.json")
+    os.environ["MER_SEND_DEAD"] = os.path.join(tmpdir, "dead.json")
+    os.environ["MER_VETO_LEDGER"] = os.path.join(tmpdir, "vetoed.json")
     idempotency.LEDGER = os.path.join(tmpdir, "ledger.json")
 
     # Hard network guard: if anything reaches the transport, the test blows up rather than sends.
@@ -158,7 +372,7 @@ def _selftest():
         if not ok:
             fails.append(label)
 
-    print("=== send_queue M38 lifecycle self-test (offline, tempfile queue) ===")
+    print("=== send_queue M38/M45 lifecycle self-test (offline, tempfile queue) ===")
 
     check("test queue is NOT the live queue", QUEUE != live_queue, QUEUE)
     check("sending is globally off", mer_send.mode() == "off", mer_send.mode())
@@ -167,7 +381,8 @@ def _selftest():
     real_send = mer_send.send
     sent_to = []
 
-    def spy(to, subject, body, case="", action="reply", in_reply_to=None, references=None):
+    def spy(to, subject, body, case="", action="reply", in_reply_to=None, references=None,
+            override=False, via_queue=False, cooldown_hours=None):
         sent_to.append((case, to, action))
         return {"sent": False, "reason": "MER_ENGINE_SEND=off (sending disabled)"}
     mer_send.send = spy
@@ -183,6 +398,11 @@ def _selftest():
               row and "VETOED" in str(row[0][2]), str(row[:1])[:70])
         check("vetoed item never reached mer_send.send", sent_to == [], str(sent_to))
         check("vetoed item is removed from the queue", all(r["id"] != vid for r in _load()))
+        # M45 — and the veto OUTLIVES the record, so tomorrow's tick will not redraft it.
+        check("the veto is durable after the record is gone",
+              idempotency.was_vetoed("MER-T1", "t_veto") is True)
+        check("was_vetoed does not answer True for a different action",
+              idempotency.was_vetoed("MER-T1", "t_other") is False)
 
         # ---- 2. an item INSIDE its veto window does not send yet, and stays queued.
         wid = enqueue("MER-T2", "vendor@example.com", "not yet", "body-window",
@@ -230,7 +450,7 @@ def _selftest():
         remedy_map.log_attempt = _spy_log
 
         def _ok_send(to, subject, body, case="", action="reply", in_reply_to=None,
-                     references=None):
+                     references=None, override=False, via_queue=False, cooldown_hours=None):
             sent_to.append((case, to, action))
             return {"sent": True, "mode": "test", "to": to, "gmail_id": "stub"}
         try:
@@ -258,6 +478,58 @@ def _selftest():
             remedy_map.log_attempt = real_log
             mer_send.send = spy
 
+        # ---- 5c. M45: an ERRORED record is retried, then dead-lettered — never discarded.
+        def _err_send(*a, **k):
+            return {"sent": False, "reason": "send error: SMTP 421 service unavailable"}
+        mer_send.send = _err_send
+        errid = enqueue("MER-T8", "vendor@example.com", "boom", "b", action="t_err",
+                        window_hours=0)
+        process()
+        live = [r for r in _load() if r["id"] == errid]
+        check("an errored record is RETAINED, not silently deleted", len(live) == 1)
+        check("...with attempts and last_error recorded",
+              live and live[0]["attempts"] == 1 and "421" in (live[0]["last_error"] or ""),
+              str(live[:1])[:90])
+        check("...and a backoff time in the future", live and live[0]["next_attempt_at"])
+        for _ in range(MAX_ATTEMPTS + 2):        # burn through the retries
+            _save([dict(r, next_attempt_at=None) for r in _load()])   # skip the backoff wait
+            process()
+        check("after MAX_ATTEMPTS it leaves the live queue",
+              all(r["id"] != errid for r in _load()))
+        check("...into the DEAD-LETTER file, not into nothing",
+              any(r["id"] == errid for r in dead_letters()), str(len(dead_letters())))
+        mer_send.send = spy
+
+        # ---- 5d. M45: a corrupt queue must NOT read as an empty queue.
+        good = _load()
+        with open(QUEUE, "w") as fh:
+            fh.write("{ this is not json")
+        try:
+            _load()
+            check("a corrupt queue refuses to load", False, "it returned silently")
+        except QueueCorrupt:
+            check("a corrupt queue refuses to load (QueueCorrupt)", True)
+        check("the last good queue is preserved at .bak", os.path.exists(QUEUE + ".bak"))
+        _save(good)
+
+        # ---- 5e. M45: a letter far past its window is flagged, never fired.
+        stale_id = enqueue("MER-T9", "vendor@example.com", "ancient", "b", action="t_stale",
+                           window_hours=0)
+        q = _load()
+        for r in q:
+            if r["id"] == stale_id:
+                r["send_after"] = (datetime.now(timezone.utc)
+                                   - timedelta(hours=MAX_SEND_AGE_HOURS + 10)).isoformat()
+        _save(q)
+        before = list(sent_to)
+        res = process()
+        row = [r for r in res if r[0] == stale_id]
+        check("a stale letter is NOT sent", sent_to == before, str(sent_to[len(before):]))
+        check("...it is reported STALE and flagged for redraft",
+              row and "STALE" in str(row[0][2]), str(row[:1])[:70])
+        check("...and stays visible in the queue",
+              any(r["id"] == stale_id and r.get("needs_redraft") for r in _load()))
+
         # ---- 6. the real (un-spied) send primitive refuses while MER_ENGINE_SEND=off.
         mer_send.send = real_send
         out = mer_send.send("vendor@example.com", "s", "b", case="MER-T4", action="t_off")
@@ -269,7 +541,8 @@ def _selftest():
     if fails:
         print("\nFAIL — %d lifecycle check(s) wrong: %s" % (len(fails), ", ".join(fails)))
         return 1
-    print("\nPASS — veto blocks, the window holds, the queue persists, unknown ids fail safely.")
+    print("\nPASS — veto blocks and persists, the window holds, errors are retried then "
+          "dead-lettered, the queue persists, unknown ids fail safely.")
     return 0
 
 
@@ -286,9 +559,19 @@ if __name__ == "__main__":
     elif a and a[0] == "--process":
         for row in process():
             print(row)
+    elif a and a[0] == "--dead":
+        d = dead_letters()
+        for r in d:
+            print("%s  %s  -> %s  [%s]" % (r.get("id"), r.get("case"), r.get("to"),
+                                           r.get("dead_reason")))
+        if not d:
+            print("(no dead letters)")
+    elif a and a[0] == "--requeue" and len(a) > 1:
+        print("requeued" if requeue_dead(a[1]) else "not found in dead letters")
     else:  # --list default
         for r in _load():
-            print("%s  %s  -> %s  after %s  vetoed=%s" %
-                  (r["id"], r["case"], r["to"], r["send_after"], r.get("vetoed")))
+            print("%s  %s  -> %s  after %s  vetoed=%s attempts=%s%s" %
+                  (r["id"], r["case"], r["to"], r["send_after"], r.get("vetoed"),
+                   r.get("attempts", 0), "  NEEDS-REDRAFT" if r.get("needs_redraft") else ""))
         if not _load():
             print("(queue empty)")

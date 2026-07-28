@@ -47,6 +47,7 @@ import remedy_map             # noqa: E402  — PHASE_LEVER: which court-gate le
 import idempotency            # noqa: E402
 import mer_config             # noqa: E402  (M32 — identity comes from the profile, not a literal)
 import case_queries           # noqa: E402  (M33 — the shared description-block parser)
+import businessday            # noqa: E402  — "today" in the USER's timezone, not the UTC container's
 
 BUILD_PROJECT = "13805886-7b4d-45bf-b985-32128f91b288"  # engine-build milestones — skip
 NUDGE_PHASES = ("Tier1", "Tier2")   # only WAIT-on-vendor tiers get a time-based follow-up
@@ -186,8 +187,34 @@ def _parse_deadline(raw):
         return None
 
 
+def _was_vetoed(case, action):
+    """True if a DURABLE veto record says the user already killed this action.
+
+    Imported defensively and resolved at CALL time, not import time: the durable veto ledger
+    is being added by another workstream, and this module must land and keep working whether
+    or not that lands first. A missing lookup means "not vetoed" — the pre-existing
+    behaviour, never an exception and never a silent block.
+    """
+    try:
+        fn = getattr(idempotency, "was_vetoed", None)
+        if fn is None:
+            return False
+        return bool(fn(case, action))
+    except Exception:
+        return False
+
+
 def _already_handled(case, action, to, body):
-    """True if this nudge was already enqueued (pending, un-vetoed) or already sent."""
+    """True if this nudge was already enqueued (pending, un-vetoed), already sent, or VETOED.
+
+    THE VETO HOLE (2026-07-28): the queue record check below only sees a LIVE queue record,
+    and a vetoed record is skipped by the `not r.get("vetoed")` test — so once the queue was
+    processed and pruned, the user's veto evaporated and the very same nudge was re-enqueued
+    the next morning. A veto that expires overnight is not a veto. A durable veto record now
+    outranks everything here.
+    """
+    if _was_vetoed(case, action):
+        return True
     for r in send_queue._load():
         if r.get("case") == case and r.get("action") == action and not r.get("vetoed"):
             return True
@@ -203,7 +230,10 @@ def due_nudges(today=None):
       {identifier, case, phase, deadline, days, vendor, item, to, subject, body, action, ready}
     `ready` is False when the vendor recipient could not be grounded from the record (list-only).
     """
-    today = today or date.today()
+    # USER-timezone today: the container runs UTC, where date.today() is already
+    # tomorrow from 19:00 CT — a nudge window would open (and a deadline read as
+    # elapsed) a full day early every evening.
+    today = today or businessday.today()
     out = []
     for it in mc.list_issues():
         if (it.get("status") or "") in ("done", "cancelled"):
@@ -286,7 +316,7 @@ def enqueue_due(today=None, verbose=False):
 
 def main():
     enqueue = "--enqueue" in sys.argv
-    today = date.today()
+    today = businessday.today()
     nudges = due_nudges(today)
     print("=== nudge (M7)  %s  (%s) ===" % (today.isoformat(), "ENQUEUE" if enqueue else "DRY-RUN"))
     print("mode: time-based Tier1/Tier2 follow-ups; Day-3 window or elapsed\n")
@@ -542,6 +572,54 @@ def _selftest():
           not any(c.startswith("mer_send.") or c == "send_queue.process" for c in called),
           ", ".join(sorted(c for c in called if "send" in c)))
     check("nudge only ever enqueues", "send_queue.enqueue" in called)
+
+    # 9. (2026-07-28) A VETO MUST SURVIVE THE NIGHT.
+    #    _already_handled only ever consulted a LIVE queue record — and a vetoed record is
+    #    explicitly skipped by that check — so once the queue drained, the user's veto was
+    #    gone and the identical nudge went back in the next morning. The durable veto lookup
+    #    is imported DEFENSIVELY (it is another workstream's), so absence must read as
+    #    "not vetoed" and never as an error or a silent block.
+    send_queue._save([])
+    if os.path.exists(idempotency.LEDGER):
+        os.remove(idempotency.LEDGER)
+    n = only(_issue("MER-V", deadline="2026-07-27"))
+    dv = n[0]
+    had = hasattr(idempotency, "was_vetoed")
+    saved = getattr(idempotency, "was_vetoed", None)
+    try:
+        if had:
+            del idempotency.was_vetoed
+        check("a MISSING veto lookup reads as 'not vetoed' (no crash, no silent block)",
+              _was_vetoed(dv["case"], dv["action"]) is False
+              and _already_handled(dv["case"], dv["action"], dv["to"], dv["body"]) is False)
+        check("...and the nudge still enqueues normally without it", len(enqueue_due(TODAY)) == 1)
+
+        send_queue._save([])
+        if os.path.exists(idempotency.LEDGER):
+            os.remove(idempotency.LEDGER)
+        idempotency.was_vetoed = lambda case, action: (case == dv["case"]
+                                                       and action == dv["action"])
+        check("a DURABLE veto suppresses the nudge on a drained queue",
+              _already_handled(dv["case"], dv["action"], dv["to"], dv["body"]) is True)
+        check("...so the vetoed nudge is NOT re-enqueued the next morning",
+              enqueue_due(TODAY) == [] and send_queue._load() == [])
+        idempotency.was_vetoed = lambda case, action: (_ for _ in ()).throw(RuntimeError("boom"))
+        check("a RAISING veto lookup degrades to 'not vetoed', never to an exception",
+              _was_vetoed(dv["case"], dv["action"]) is False)
+    finally:
+        if hasattr(idempotency, "was_vetoed"):
+            del idempotency.was_vetoed
+        if had:
+            idempotency.was_vetoed = saved
+    check("the veto lookup is resolved at CALL time, not bound at import",
+          "getattr(idempotency, \"was_vetoed\", None)" in src,
+          "so it picks the function up whenever the other workstream lands it")
+
+    # 10. (2026-07-28) TIMEZONE — the nudge window must open on the USER's day.
+    check("nudge takes 'today' from the profile timezone, never the UTC container",
+          not any(c == "date.today" for c in called),
+          "date.today() on a UTC container is already tomorrow from 19:00 CT")
+    check("businessday.today is what it calls instead", "businessday.today" in called)
 
     if fails:
         print("\nFAIL — %d gate(s) wrong: %s" % (len(fails), ", ".join(fails)))

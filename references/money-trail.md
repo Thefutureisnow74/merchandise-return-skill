@@ -50,9 +50,14 @@ they're the ones most cases forget to name, so their levers go unused.
 - **Two distinct levers:**
   1. **CFPB complaint against the lender** — for financing/installment disputes the CFPB is the primary
      regulator; the lender must respond.
-  2. **Payoff status as leverage** — if the user is still paying the EIP/loan on a defective item, the
-     open balance is itself a pressure point (stop-payment risk, dispute of the financed amount). Track
-     whether the plan is **open (still paying), paid off, or in dispute** — it changes the play.
+  2. **Payoff status as context** — track whether the plan is **open (still paying), paid off, or in
+     dispute**, because it changes which levers exist (an open balance keeps the CFPB lever live; a
+     paid-off plan does not).
+     🛑 **Never advise the user to stop paying, withhold payments, or place a stop payment as
+     leverage.** On a financed item that is not pressure on the vendor — it is a missed payment on
+     the *user's* credit file, and on secured financing (auto loan, store card, phone EIP) it invites
+     collections, repossession, or device blocking. The dispute goes to the lender in writing through
+     its dispute process while payments continue.
 - **Record the payoff status** in MR Money Parties (e.g. "EIP: T-Mobile financing — 14 of 24 payments,
   open").
 

@@ -93,6 +93,32 @@ ENVIRONMENT (all optional; every one has a working default)
     MER_HOTPATH_DISPATCH_TIMEOUT seconds to let a dispatched engine run        (default 900)
     MER_HOTPATH_ENGINE_ARGS      override the dispatched engine args, space-separated
                                  (default: --commit --notify)
+    MER_ENV_FILE                 shared KEY=VALUE secrets file to hand the dispatched child
+                                 (default: <data dir>/.env if it exists)
+
+WHY THIS MODULE LOADS A SECRETS FILE (M46)
+------------------------------------------
+It did not, and that was a silent, total failure of the hot path for an unknown number of
+days. The other entry points are shell wrappers that each `export` MULTICA_TOKEN out of the
+shared .env before running Python; this job is invoked directly by the scheduler, whose own
+env-file setting is optional and was not configured. So the minute loop looked perfectly
+healthy (rc=0, "idle — no mailbox change", 1439 times a day) and the ONE thing it exists to
+do — dispatch the engine when mail actually lands — died every single time with
+
+    multica_api.MulticaAPIError: GET /properties -> 401: missing authorization
+
+A component whose failure mode only fires on the rare path it was built for is a component
+that will be broken when you need it and green every other minute. The child now inherits the
+same credentials the wrappers export, resolved here, from config, with no host literal.
+
+AND IT NO LONGER EATS THE MAIL THAT BROKE IT
+--------------------------------------------
+`decide()` advances the mailbox cursor and `tick()` used to save that advanced cursor after
+the dispatch, UNCONDITIONALLY. So a failed dispatch left the cursor sitting past the very
+message that triggered it, and that message could never fire the hot path again — the 401
+did not merely delay the reply, it LOST it. The authors got this exactly right for the
+lock-busy branch (which rewinds on purpose) and missed it for the failure branch. A non-zero
+dispatch now rewinds the cursor the same way, so the next tick re-evaluates the same mail.
 
 No identity, no case identifier, no host path, no container name is written in this file.
 """
@@ -114,6 +140,7 @@ sys.path.insert(0, HERE)
 # Anything that can classify, draft or send is reached by SUBPROCESS, never by import, so
 # this process has no in-memory route to a send function. See _selftest().
 import gmail_transport  # noqa: E402
+import heartbeat        # noqa: E402  (M46 — liveness ledger + the one alarm bell)
 
 GMAIL_PROFILE = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
 GMAIL_HISTORY = "https://gmail.googleapis.com/gmail/v1/users/me/history"
@@ -181,6 +208,60 @@ def engine_args():
     if raw is None or not raw.strip():
         return list(DEFAULT_ENGINE_ARGS)
     return raw.split()
+
+
+# ------------------------------------------------------------------- shared credentials
+
+# Exactly the keys the shell wrappers export. Named explicitly rather than sourced, because
+# the shared secrets file in the wild contains prose, comments and half-written lines, and
+# `source`-ing one of those takes the whole job down (the lesson already encoded in
+# case_tick_cron.sh's per-key `grep`).
+SHARED_ENV_KEYS = ("MULTICA_TOKEN", "MULTICA_WORKSPACE_ID", "MULTICA_SERVER_URL",
+                   "NANOGPT_API_KEY", "MINIMAX_API_KEY")
+
+
+def env_file():
+    """The shared KEY=VALUE secrets file, or None. Config first, data-dir default second."""
+    p = os.environ.get("MER_ENV_FILE")
+    if p:
+        return p
+    p = os.path.join(data_dir(), ".env")
+    return p if os.path.isfile(p) else None
+
+
+def load_shared_env(path=None, keys=SHARED_ENV_KEYS, environ=None):
+    """Fill in any of `keys` that are missing from the environment. Returns what it added.
+
+    DEFENSIVE ON PURPOSE, in both directions. An already-set variable is never overwritten,
+    so a job that deliberately sets a different workspace keeps it. And a value already
+    present is not re-read, so this is a no-op on the hosts where the wrapper already
+    exported everything. multica_api resolves its token lazily now, but this module cannot
+    assume the deployed copy of that module has caught up — it demonstrably had not on
+    2026-07-28 — so the environment is corrected here regardless.
+    """
+    environ = os.environ if environ is None else environ
+    path = path if path is not None else env_file()
+    added = {}
+    if not path or not os.path.isfile(path):
+        return added
+    wanted = {k for k in keys if not (environ.get(k) or "").strip()}
+    if not wanted:
+        return added
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                if k in wanted and k not in added:
+                    added[k] = v.strip().strip('"').strip("'")
+    except OSError:
+        return added
+    for k, v in added.items():
+        environ[k] = v
+    return added
 
 
 # ------------------------------------------------------------------------------ cursor state
@@ -375,6 +456,9 @@ def dispatch(args=None, runner=None, timeout=None):
     if runner is not None:
         return runner(cmd)
     env = dict(os.environ)
+    # The child needs the board credentials this job's own environment may not carry. See
+    # the module docstring: without this the dispatch 401'd every time it mattered.
+    load_shared_env(environ=env)
     env["PYTHONIOENCODING"] = "utf-8"
     # MER_ENGINE_SEND is deliberately NOT set here — the send gate belongs to the job/env.
     try:
@@ -389,10 +473,24 @@ def dispatch(args=None, runner=None, timeout=None):
 
 # ------------------------------------------------------------------------------- one tick
 
-def tick(token=None, getter=_get, runner=None, dry_run=False, force=False, out=None):
-    """One gate check + conditional dispatch. Returns a dict describing what happened."""
+def _default_alerter(text, key):
+    return heartbeat.alert(text, key=key)
+
+
+def tick(token=None, getter=_get, runner=None, dry_run=False, force=False, out=None,
+         alerter=None):
+    """One gate check + conditional dispatch. Returns a dict describing what happened.
+
+    `alerter(text, key)` is injectable so the self-test can prove the alarm fires without a
+    network call. Default: heartbeat.alert (Telegram, with a cooldown per key).
+    """
     out = out or sys.stdout
+    alerter = alerter or _default_alerter
     st = load_state()
+    # The cursor as it stood BEFORE this tick. This is the value we must be able to put back
+    # if the dispatch fails — otherwise the mail that triggered the dispatch is skipped
+    # forever, because the next tick compares against a cursor already past it.
+    prior_hid = st.get("history_id")
     if force:
         fired, reason = True, "forced"
     else:
@@ -436,13 +534,70 @@ def tick(token=None, getter=_get, runner=None, dry_run=False, force=False, out=N
     st["consecutive_idle"] = 0
     st["last_dispatch_at"] = datetime.now(timezone.utc).isoformat()
     st["last_dispatch_code"] = code
+
+    if code:
+        # ---- the compounding bug, closed ----------------------------------------------
+        # Same reasoning as the LockBusy branch above, for the failure the authors missed:
+        # the engine did NOT process this mail, so the cursor must not move past it. Rewind,
+        # and the next tick (60 seconds away) re-evaluates the same message. Combined with
+        # the alert below, a broken dispatch is now loud AND recoverable instead of silent
+        # AND lossy.
+        st["history_id"] = prior_hid
+        st["consecutive_dispatch_fail"] = int(st.get("consecutive_dispatch_fail") or 0) + 1
+        st["last_dispatch_error_at"] = st["last_dispatch_at"]
+        st["last_dispatch_tail"] = "\n".join(
+            [ln for ln in str(output or "").splitlines() if ln.strip()][-20:])[:4000]
+    else:
+        st["consecutive_dispatch_fail"] = 0
     save_state(st)
+
     out.write("mer_hotpath: DISPATCHED engine (%s) -> exit %s\n" % (reason, code))
     if output:
         tail = "\n".join([ln for ln in str(output).splitlines() if ln.strip()][-12:])
         out.write(tail + "\n")
+
+    if code:
+        n = st["consecutive_dispatch_fail"]
+        tail = st.get("last_dispatch_tail") or "(no output)"
+        heartbeat.log_error("mer-hotpath", "dispatch rc=%s (failure #%d)\n%s" % (code, n, tail))
+        detail = _dispatch_failure_detail(tail)
+        # Keyed on the CONDITION, not the message: the count and the timestamp change every
+        # minute, and a key that changes every minute is a key that never de-duplicates.
+        alerter("\U0001f6a8 mer-hotpath: the engine dispatch FAILED (exit %s, %d in a row).\n"
+                "%s\nThe mailbox cursor has been rewound, so the triggering mail will be "
+                "retried — but nothing is being classified until this is fixed.\n\n%s"
+                % (code, n, detail, tail[-900:]),
+                "hotpath-dispatch-fail:%s" % _failure_kind(tail))
+        out.write("mer_hotpath: cursor REWOUND to %s (dispatch failed) — %s\n"
+                  % (prior_hid, detail))
+        result["rewound"] = True
+
     result.update({"dispatched": True, "exit_code": code})
     return result
+
+
+def _failure_kind(tail):
+    """A stable de-duplication key for the class of failure, from the child's output."""
+    low = str(tail or "").lower()
+    if "missing authorization" in low or "401" in low:
+        return "multica-401"
+    if "invalid_grant" in low or "unauthorized_client" in low:
+        return "google-auth"
+    if "timed out" in low or "timeout" in low:
+        return "timeout"
+    return "other"
+
+
+def _dispatch_failure_detail(tail):
+    kind = _failure_kind(tail)
+    return {
+        "multica-401": "MULTICA AUTH FAILURE (401) — the board token is missing or rejected "
+                       "in the dispatched child's environment. Check MULTICA_TOKEN in the "
+                       "shared .env and in this job's environment.",
+        "google-auth": "GOOGLE/GMAIL AUTH FAILURE — the OAuth refresh token is dead. No mail "
+                       "can be read until the mailbox is re-authorised.",
+        "timeout": "The dispatched engine exceeded its timeout and was killed.",
+    }.get(kind, "The dispatched engine exited non-zero. See the tail below.")
 
 
 # ---------------------------------------------------------------------- adaptive long-poll
@@ -634,6 +789,77 @@ def _selftest():
     r = tick(token="tok", getter=fake_getter("250", added=1), runner=fake_runner, dry_run=True)
     ck("--dry-run never dispatches", r["dispatched"] is False and len(calls) == 1, r)
 
+    print("D2. a FAILED dispatch must not eat the mail that triggered it (M46)")
+    alerts = []
+
+    def capture(text, key):
+        alerts.append((key, text))
+        return True, "captured"
+
+    def failing_runner(cmd):
+        calls.append(cmd)
+        # The real child output starts with a Python traceback banner. That banner is OMITTED
+        # from this fixture on purpose: tick() echoes the child's output tail, run_tests.py
+        # scans module output for the banner, and a green self-test would otherwise be
+        # reported as a crash. The load-bearing part — the error line the failure classifier
+        # keys on — is verbatim.
+        return 1, ('  File "/x/multica_api.py", line 55, in _req\n'
+                   "multica_api.MulticaAPIError: GET /properties -> 401: "
+                   '{"error":"missing authorization"}')
+
+    save_state({"history_id": "300"})
+    n_before = len(calls)
+    r = tick(token="tok", getter=fake_getter("350", added=1), runner=failing_runner,
+             alerter=capture)
+    ck("a failing dispatch still reports itself dispatched", r["dispatched"] is True, r)
+    ck("a failing dispatch reports the exit code", r.get("exit_code") == 1, r)
+    ck("THE CURSOR IS REWOUND so the mail fires again next tick",
+       load_state().get("history_id") == "300", load_state())
+    ck("the failure is counted", load_state().get("consecutive_dispatch_fail") == 1,
+       load_state())
+    ck("a failing dispatch ALERTS", len(alerts) == 1, alerts)
+    ck("the alert key names the failure class, not the timestamp",
+       alerts and alerts[0][0] == "hotpath-dispatch-fail:multica-401", alerts)
+    ck("the alert says what is actually wrong",
+       alerts and "MULTICA AUTH FAILURE" in alerts[0][1], alerts)
+    ck("the dispatch was attempted exactly once", len(calls) == n_before + 1, calls)
+
+    r = tick(token="tok", getter=fake_getter("360", added=1), runner=failing_runner,
+             alerter=capture)
+    ck("consecutive failures accumulate", load_state().get("consecutive_dispatch_fail") == 2,
+       load_state())
+    ck("the cursor stays rewound while it keeps failing",
+       load_state().get("history_id") == "300", load_state())
+
+    r = tick(token="tok", getter=fake_getter("370", added=1), runner=fake_runner,
+             alerter=capture)
+    ck("a recovered dispatch advances the cursor again",
+       load_state().get("history_id") == "370", load_state())
+    ck("a recovered dispatch clears the failure counter",
+       load_state().get("consecutive_dispatch_fail") == 0, load_state())
+
+    print("D3. the dispatched child inherits the shared credentials (M46)")
+    envp = os.path.join(tmp, "shared.env")
+    with open(envp, "w", encoding="utf-8") as fh:
+        fh.write("# a real secrets file has prose and junk in it\n"
+                 "this line is not a KEY=VALUE pair at all\n"
+                 'MULTICA_TOKEN="tok-from-file"\n'
+                 "MULTICA_WORKSPACE_ID=ws-from-file\n"
+                 "UNRELATED_SECRET=nope\n")
+    fake_env = {}
+    added = load_shared_env(path=envp, environ=fake_env)
+    ck("the token is read out of the shared file", fake_env.get("MULTICA_TOKEN") == "tok-from-file",
+       fake_env)
+    ck("quotes are stripped", '"' not in fake_env.get("MULTICA_TOKEN", '"'))
+    ck("only the named keys are taken", "UNRELATED_SECRET" not in fake_env, fake_env)
+    ck("prose lines do not break the parse", "this line is not a KEY" not in str(added))
+    preset = {"MULTICA_TOKEN": "already-set"}
+    load_shared_env(path=envp, environ=preset)
+    ck("an already-set variable is NEVER overwritten",
+       preset["MULTICA_TOKEN"] == "already-set", preset)
+    ck("a missing env file is not an error",
+       load_shared_env(path=os.path.join(tmp, "nope.env"), environ={}) == {})
+
     print("E. adaptive backoff")
     lo, hi = min_interval(), max_interval()
     ck("a hit resets to the fast interval", next_interval(hi, True) == lo)
@@ -730,18 +956,48 @@ def main(argv=None):
         print("  state file  : %s" % state_file())
         print("  lock file   : %s%s" % (lock_file(),
                                         "  (HELD)" if os.path.exists(lock_file()) else ""))
+        print("  env file    : %s" % (env_file() or "(none found — the dispatched child will "
+                                                    "inherit this process's environment only)"))
         print("  cursor      : %s" % (st.get("history_id") or "(no baseline yet)"))
         print("  last check  : %s" % (st.get("checked_at") or "-"))
         print("  last dispatch: %s (exit %s)" % (st.get("last_dispatch_at") or "-",
                                                  st.get("last_dispatch_code")))
+        # last_dispatch_code used to be written and never read by anything. It is now the
+        # health signal for this component, so print it, act on it, and heartbeat it.
+        nfail = int(st.get("consecutive_dispatch_fail") or 0)
+        print("  dispatch fails (consecutive): %d%s"
+              % (nfail, "   <-- THE ENGINE IS NOT RUNNING" if nfail else ""))
+        if nfail:
+            print("  last error at: %s" % (st.get("last_dispatch_error_at") or "-"))
+            print("  last error tail:")
+            for ln in (st.get("last_dispatch_tail") or "").splitlines()[-10:]:
+                print("    %s" % ln)
         print("  idle ticks  : %s" % (st.get("consecutive_idle") or 0))
         print("  would run   : %s" % " ".join(engine_command()))
         return 0
     if "--run-forever" in argv:
         run_forever(runner=None)
         return 0
-    r = tick(dry_run=("--dry-run" in argv), force=("--force" in argv))
-    return 0 if r.get("dispatched") or not r.get("exit_code") else 0
+
+    # Credentials first: the child inherits this environment, and on the scheduler path
+    # nothing else fills it in.
+    load_shared_env()
+
+    dry = "--dry-run" in argv
+    forced = "--force" in argv
+
+    def _once(note):
+        r = tick(dry_run=dry, force=forced)
+        code = r.get("exit_code")
+        if code:
+            note("engine dispatch exited %s (%s)"
+                 % (code, _failure_kind(load_state().get("last_dispatch_tail"))))
+        return 0
+
+    # HEARTBEAT: every tick — idle, dispatching, or crashing — writes {name, ts, ok, err}.
+    # This is what makes "the hot path has not run since Tuesday" a detectable statement
+    # rather than something a human has to go and notice.
+    return heartbeat.guard("mer-hotpath", _once, expect_seconds=300.0, window=None)
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@
 
 ```
 cd engine
-python3 scheduler.py --install          # prints the plan, changes NOTHING
-python3 scheduler.py --install --live   # actually installs it
+python scheduler.py --install          # prints the plan, changes NOTHING
+python scheduler.py --install --live   # actually installs it
 ```
 
 That is the whole task. Everything below is why, and what to do when it is not that simple.
@@ -69,7 +69,7 @@ When you have watched the drafts for a week and trust them, copy the manifest an
 ```
 cp schedule.json.example schedule.json      # your copy wins over the shipped default
 # edit schedule.json: "MER_ENGINE_SEND": "live"
-python3 scheduler.py --install --live       # re-install so the change takes effect
+python scheduler.py --install --live       # re-install so the change takes effect
 ```
 
 Values: `off` (draft nothing) · `test` (drafts go to you) · `live` (drafts go to the vendor after
@@ -89,7 +89,7 @@ the veto window).
 | `forever` | containers, or a host with none of the above | Nothing is registered — `scheduler.py --run-forever` **is** the clock, in your terminal. |
 
 ```
-python3 scheduler.py --run-forever
+python scheduler.py --run-forever
 ```
 
 Keep that alive however you keep anything alive: a terminal you leave open, a `restart: always`
@@ -101,15 +101,15 @@ Windows backend refuses.
 ## Every command
 
 ```
-python3 scheduler.py --status              # what is installed, and when did each job last run?
-python3 scheduler.py --list                # the manifest, as a table
-python3 scheduler.py --install             # DRY RUN — print the plan, change nothing
-python3 scheduler.py --install --live      # apply it
-python3 scheduler.py --uninstall --live    # remove exactly what was installed, nothing else
-python3 scheduler.py --run mer-case-tick   # run one job right now, exactly as the clock would
-python3 scheduler.py --run mer-engine --dry-run   # show what that job would execute
-python3 scheduler.py --run-forever         # be the clock
-python3 scheduler.py --help
+python scheduler.py --status              # what is installed, and when did each job last run?
+python scheduler.py --list                # the manifest, as a table
+python scheduler.py --install             # DRY RUN — print the plan, change nothing
+python scheduler.py --install --live      # apply it
+python scheduler.py --uninstall --live    # remove exactly what was installed, nothing else
+python scheduler.py --run mer-case-tick   # run one job right now, exactly as the clock would
+python scheduler.py --run mer-engine --dry-run   # show what that job would execute
+python scheduler.py --run-forever         # be the clock
+python scheduler.py --help
 ```
 
 **`--dry-run` is the default.** `--install` and `--uninstall` print their plan and change nothing
@@ -204,9 +204,9 @@ never drift from the schedule you wrote.
 `--install --live`.
 
 **A job says installed but `LAST LOG WRITE` says never run.** The clock is registered but the job is
-not executing. Run it by hand — `python3 scheduler.py --run <job>` — and read what it says. The
+not executing. Run it by hand — `python scheduler.py --run <job>` — and read what it says. The
 usual causes are an interpreter that cannot import the engine's dependencies (`--python`) and a
-missing profile (`python3 onboard.py`).
+missing profile (`python onboard.py`).
 
 **The Windows backend refuses a job.** Task Scheduler has no cron expression, so `scheduler.py`
 expands each job into one task per firing time and refuses above 24 a day, or when a job restricts

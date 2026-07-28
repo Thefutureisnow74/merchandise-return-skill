@@ -1,5 +1,10 @@
 # Jurisdiction Lookup — nationwide (all 50 states + DC)
 
+> **Not legal advice.** This file applies published consumer rules to facts the USER supplies, and
+> everything built from it goes out over the **user's own signature**. Every statutory citation here
+> must be verified live before it goes in a letter or a filing. For a signed arbitration agreement, a
+> counter-claim, or an amount that matters, the user should talk to an attorney.
+
 **Purpose.** Given the user's state (and county), resolve the right consumer-protection statute,
 the pre-suit notice rule, the small-claims venue, and the civil-rights avenue for their case. This
 is the data the **Tier-0 remedy map** reads.
@@ -90,7 +95,7 @@ Columns: **Primary consumer statute** (the deceptive/unfair-practices act, unles
 | SC | Unfair Trade Practices Act | Verify | ~$7,500 | SC Human Affairs Commission |
 | SD | Deceptive Trade Practices statute | Verify | ~$12,000 | SD Div. of Human Rights |
 | TN | Consumer Protection Act | Verify | ~$25,000 | TN Human Rights Commission |
-| **TX** | **DTPA** (Bus & Com §17.41) | **Yes — 60-day written notice (§17.505)** | ~$20,000 (JP court) | TX has **no broad state public-accom. retail law** — use federal §1981 / Title II |
+| **TX** | **DTPA** (Bus & Com §17.41) | **Yes — 60-day written notice (§17.505)** | ~$20,000 (JP court) | **Disability: Tex. Hum. Res. Code ch. 121** (private cause of action, §121.004). No broad race/religion/sex retail public-accom. statute — use federal §1981 / Title II for those |
 | UT | Consumer Sales Practices Act | Verify | ~$15,000 | UT Antidiscrimination & Labor Div. |
 | VT | Consumer Protection Act | Verify | ~$5,000 | VT Human Rights Commission |
 | VA | Consumer Protection Act | Verify | ~$5,000 | VA Office of Civil Rights (AG) |
@@ -99,14 +104,17 @@ Columns: **Primary consumer statute** (the deceptive/unfair-practices act, unles
 | WI | Deceptive Trade Practices Act | Verify | ~$10,000 | WI Equal Rights Division |
 | WY | Consumer Protection Act | Verify | ~$6,000 | WY Dept. of Workforce — Labor Standards |
 
-*(Caps and pre-suit "Verify" cells are prompts to confirm live, not gaps in the strategy. Statute
-names and the "Yes" pre-suit flags are the stable layer.)*
+> 🛑 **"Verify" in the pre-suit column is a STOP, not a "no".** It means *this row was never
+> confirmed — go check the current rule live before you send a pre-suit demand or file.* A missed
+> mandatory pre-suit notice can bar the lawsuit entirely. Do not read a "Verify" row as permission to
+> use the generic no-notice letter (`letter-templates.md` §5c). Caps and fees are likewise
+> confirm-live. Statute names and the explicit **"Yes"** pre-suit flags are the stable layer.
 
 ---
 
 ## Deep dives (the two we need first)
 
-### Texas (King's own cases)
+### Texas
 - **Statute:** Texas Deceptive Trade Practices Act (DTPA), Bus. & Com. Code §17.41 et seq. Consumer
   friendly: economic + up to **treble** damages for knowing violations, **plus attorney's fees**.
 - **Mandatory pre-suit notice:** §17.505 — **60-day written notice** of the complaint + amount of
@@ -115,8 +123,13 @@ names and the "Yes" pre-suit flags are the stable layer.)*
   manufacturer warranty; strongest when the goods were "defective from the start."
 - **Small claims:** Justice of the Peace court, cap historically **$20,000** (verify current). Venue =
   the county/precinct where the defendant is or the transaction occurred.
-- **Civil rights:** Texas has no broad Unruh-style retail public-accommodations statute — lead with
-  **federal §1981** (race, contracts) and Title II where it fits.
+- **Civil rights:** Texas has **no** broad Unruh-style statute covering race/religion/sex in retail —
+  for those, lead with **federal §1981** (race, contracts) and Title II where it fits. **Texas DOES
+  have a disability public-accommodations law:** Tex. Hum. Res. Code ch. 121 (Participation in Social
+  and Economic Activities). §121.003 bars refusing a person with a disability the use of a public
+  facility, and failing to make reasonable accommodations or provide auxiliary aids; §121.004 gives
+  the person a **private cause of action for damages**, with a conclusive presumption of damages of
+  at least $300, alongside a misdemeanor penalty. Verify the current text before citing it.
 
 ### California (most-populous; verified in depth)
 - **Statutes, stacked:** **CLRA** (Civ. §1750 — consumer remedies, incl. actual + punitive),
@@ -126,23 +139,57 @@ names and the "Yes" pre-suit flags are the stable layer.)*
   (Civ. §1782). Send it; it often settles and it preserves the damages claim.
 - **Small claims:** individual cap **~$12,500** (verify current). Venue = defendant's residence/place
   of business or where the injury/transaction occurred.
-- **Civil rights (strong):** **Unruh Civil Rights Act** (Civ. §51) — bars discrimination by *any*
-  business establishment; **statutory minimum $4,000 per violation** independent of the item's value.
-  Agency: **California Civil Rights Department** (formerly DFEH). This can dwarf the underlying refund
-  and materially changes leverage — but only pursue on supporting facts, never manufactured.
+- **Civil rights:** **Unruh Civil Rights Act** (Civ. §51) — reaches *any* business establishment,
+  which is broader than most states. Agency: **California Civil Rights Department** (formerly DFEH).
+  Unruh does attach a statutory minimum per violation (verify the current figure), **but the bar in
+  the Tier 3-D section above governs: a specific act tied to a protected characteristic, or a
+  comparator, sworn by the user.** The number is never the reason to file.
 
 ---
 
-## Civil-rights track resolution (Tier 3-D)
+## Civil-rights track (Tier 3-D) — read the bar before the remedy
 
-When the intake discrimination flag is set AND facts support it:
-1. **Federal always available:** §1981 (race/contracts), Title II (public accommodations).
-2. **State statute:** look up the row's civil-rights avenue. CA (Unruh, $4k min) is the strongest;
-   many states route through a Human Rights / Civil Rights Commission with an administrative complaint.
-3. **Advocacy org:** identify the case-appropriate one (NAACP, ACLU affiliate, local legal aid,
-   law-school civil-rights clinic) — for pressure and, on a real pattern, possible representation.
-4. Run this **in parallel** with the consumer ladder from the moment it's flagged — it does not wait
-   for Tier 2 to fail.
+### 🛑 The bar comes first
+
+**A civil-rights complaint is sworn under penalty of perjury.** The user signs it. It is not a
+negotiating chip, it is not an add-on to strengthen a refund demand, and a weak one damages the
+consumer case it is attached to and exposes the person who filed it.
+
+**Rude, slow, or unhelpful service is not discrimination. Being denied a return is not
+discrimination.** What supports a claim is **a specific thing said or done tied to a protected
+characteristic**, or **a comparator** — someone outside the user's group treated differently in the
+same situation. **If the user cannot name that, we do not file, and the consumer ladder is not
+weakened by its absence.**
+
+The federal bar is high on a retail-return fact pattern:
+- **42 U.S.C. §1981** requires **intentional** discrimination and **but-for** causation — the user
+  must show the outcome would have been different but for race. *Comcast Corp. v. National Assn. of
+  African American-Owned Media*, 589 U.S. 327 (2020), rejected a lower "motivating factor" standard.
+- **Title II** covers lodging, restaurants, and places of entertainment. **Retail goods sales are a
+  weak Title II fit**, and Title II offers injunctive relief only — no damages.
+
+### The lane
+
+**Tier 3-D is 🔴 in its entirety and never fires automatically.** Before anything is drafted or
+filed, the agent must (a) put the specific facts back to the user in the user's own words, (b) state
+plainly that the filing is sworn, and (c) obtain a **named, per-item YES** from the user for that
+specific filing. Record the confirmation on the case. No civil-rights document is ever queued on a
+veto window.
+
+### Only once the bar is met, and the user has said yes
+
+1. **Federal:** §1981 (race, contracts) — subject to the standard above; Title II where it genuinely
+   fits.
+2. **State statute:** look up the state's row below. Coverage varies enormously — some states reach
+   any business establishment and attach statutory damages; some cover only disability; some have no
+   broad retail public-accommodations law at all. Many route through a Human Rights / Civil Rights
+   Commission with an **administrative complaint and its own filing deadline** (often short —
+   180/300 days). Check that deadline early even if nothing is filed.
+3. **Advocacy org:** the case-appropriate one (NAACP, ACLU affiliate, local legal aid, law-school
+   civil-rights clinic) — and, on a real pattern, possible representation. An advocacy referral is
+   often the better first step than a filing.
+4. Where it is pursued, it runs **in parallel** with the consumer ladder rather than after it — but
+   parallel means "not blocked by Tier 2", not "fires on its own".
 
 ---
 

@@ -23,7 +23,7 @@ auto-reply).
    4. subject tokens (case id, claim #, RMA/ticket number)
    Mail that matches nothing **and** isn't a claim (step 4) is dropped — no noise.
 
-**2. CLASSIFY** the matched mail with `scripts/reply_classify.py` →
+**2. CLASSIFY** the matched mail with `engine/reply_classify.py` →
    `refund · partial · refused · needs_info · legal_threat · discrimination_signal · other`.
    (Heuristic fallback; live path uses Claude for judgment on the full thread.)
 
@@ -43,10 +43,13 @@ auto-reply).
    classification comment (wake-agent safe — see SKILL.md §4), carrying: category, suggested next
    action, and its send lane.
 
-**6. CADENCE** — the watcher runs **once every hour, Monday–Friday, 8:00 AM–5:00 PM Central**
-   (business hours only; idle on evenings and weekends). Cron: `0 13-22 * * 1-5` UTC
-   (13:00–22:00 UTC = 08:00–17:00 CT during CDT). This keeps a resolution or refusal from sitting
-   unseen for a day, without polling around the clock.
+**6. CADENCE** — two jobs, and the fast one is the one that matters:
+   - **`mer-hotpath` runs every minute, 24/7** (`* * * * *`) — it watches the mailbox cursor and
+     fires the engine the moment a reply lands. This is why a vendor reply is not sitting unseen for
+     an hour, and why nights and weekends are **not** idle.
+   - `mer-engine` sweeps hourly on `0 13-22 * * 1-5` **UTC** (= 08:00–17:00 CT) as the backstop.
+   Every expression in `engine/schedule.json.example` is **UTC**; the CT intent is documented per
+   job. Read the manifest rather than repeating a remembered schedule.
 
 ---
 
@@ -59,5 +62,7 @@ auto-reply).
 - **Preserve discrimination wording verbatim** as evidence when that category fires.
 
 ## Implements
-`scripts/reply_classify.py` (classify + lane) · the generalized inbox watcher (match + cadence) ·
-`scripts/case_tick.py` (reads reply-state to advance/branch). Live wiring = Blueprint M6.
+`engine/reply_classify.py` (classify + lane) · `engine/inbox_watcher.py` + `engine/mer_hotpath.py`
+(match + cadence) · `engine/mer_engine.py` (writes `MR Last Vendor Reply` on every substantive
+inbound vendor reply) · `engine/case_tick.py` (reads that property's date in its escalation-hold
+gate, so the ladder does not escalate over a vendor who is actually answering).

@@ -39,6 +39,31 @@ COURT_LEVERS = frozenset({
     "court",
 })
 
+# Court keys are also written BY HAND, with a venue glued on: MER-76's map (2026-07-28)
+# contained `small_claims_dallas`, which is not in COURT_LEVERS, so remedy_complete counted
+# it as an ordinary owed lever — court became a prerequisite for court, the exact circularity
+# the module docstring claims to prevent, and the case could never reach Tier 4.
+# is_court_lever() recognises the FAMILY, not just the three canonical spellings.
+COURT_PREFIXES = ("small_claims", "smallclaims", "tier4", "court", "justice_court",
+                  "district_court", "magistrate")
+
+
+def is_court_lever(lever):
+    """True if `lever` names the court destination in any plausible hand-written form.
+
+    Recognises the canonical keys plus venue-suffixed variants (small_claims_dallas,
+    tier4_court_tx, court_jp_precinct_3, ...). Deliberately one-way/greedy: a false positive
+    means one lever is not required before court; a false negative means COURT IS A
+    PREREQUISITE FOR COURT and the case is barred from the courthouse forever. The second
+    failure is unrecoverable without a human noticing, so we widen.
+    """
+    k = str(lever or "").strip().lower()
+    if not k:
+        return False
+    if k in COURT_LEVERS:
+        return True
+    return any(k == p or k.startswith(p + "_") for p in COURT_PREFIXES)
+
 # Human-readable labels for the summary. Any key not listed falls back to a
 # de-underscored title-case rendering, so unknown/new lever keys still read cleanly.
 LEVER_LABELS = {
@@ -50,6 +75,11 @@ LEVER_LABELS = {
     "ftc": "FTC report",
     "pre_suit_notice": "Statutory pre-suit demand notice",
     "state_statute": "State consumer-protection statute remedy",
+    # Federal warranty claim. Added 2026-07-28 because it appeared in a hand-written live map
+    # (MER-76) where, being unknown to this table, log_attempt() refused it BY DESIGN — the
+    # lever could never be satisfied and the case could never reach Tier 4. A real, nameable
+    # avenue belongs in the vocabulary rather than being silently unsatisfiable.
+    "magnuson_moss": "Magnuson-Moss Warranty Act (federal warranty claim)",
     "arbitration": "Contractual arbitration clause",
     "civil_rights": "Civil-rights / discrimination avenue",
     "class_action": "Class-action check",
@@ -79,13 +109,35 @@ def remedy_complete(remedy_map, attempted):
                                      #   lever is in attempted
           "missing":  [levers],      # applicable levers still owed (sorted, deduped)
           "attempted":[levers],      # applicable levers confirmed done (sorted, deduped)
+          "no_map":   bool,          # there was nothing to exhaust — fails CLOSED
+          "reason":   str,           # why the verdict is what it is
         }
 
     Levers in attempted that are not in remedy_map are ignored — they cannot make an
     inapplicable avenue "count," and they cannot fabricate readiness.
+
+    ⚠️ FAILS CLOSED ON AN EMPTY MAP (2026-07-28). Set arithmetic used to make an empty map
+    the MOST permissive input there is: empty required -> empty missing -> ready_for_court
+    True. Every caller therefore had to remember to test `if not remedy_map` FIRST, and only
+    two of them did. The guard now lives in the library, where it cannot be forgotten: an
+    empty map (or a map containing nothing but court levers) means the levers were never
+    ENUMERATED, not that none apply, and court stays shut.
     """
-    required = {str(x) for x in remedy_map} - COURT_LEVERS
-    done = {str(x) for x in attempted}
+    raw = [str(x).strip() for x in remedy_map if str(x).strip()]
+    required = {x for x in raw if not is_court_lever(x)}
+    done = {str(x).strip() for x in attempted if str(x).strip()}
+
+    if not required:
+        return {
+            "ready_for_court": False,
+            "missing": [],
+            "attempted": [],
+            "no_map": True,
+            "reason": ("EMPTY remedy map (%d key(s) given, 0 of them non-court) — Tier 0 never "
+                       "enumerated this case's levers, so there is nothing to have exhausted. "
+                       "An empty remedy map is not 'no avenues apply'; it is 'nobody looked'. "
+                       "Court stays shut. Run remedy_map.py to build the map." % len(raw)),
+        }
 
     missing = required - done
     attempted_applicable = required & done
@@ -94,6 +146,11 @@ def remedy_complete(remedy_map, attempted):
         "ready_for_court": len(missing) == 0,
         "missing": sorted(missing),
         "attempted": sorted(attempted_applicable),
+        "no_map": False,
+        "reason": ("all %d applicable lever(s) attempted + logged" % len(attempted_applicable)
+                   if not missing else
+                   "%d of %d lever(s) still owed: %s"
+                   % (len(missing), len(required), ", ".join(sorted(missing)))),
     }
 
 
@@ -101,6 +158,8 @@ def summarize(remedy_map, attempted, case=None):
     """Short human summary of what is still owed before court."""
     r = remedy_complete(remedy_map, attempted)
     head = "Case %s — " % case if case else ""
+    if r.get("no_map"):
+        return "%sNOT READY FOR COURT — %s" % (head, r["reason"])
     if r["ready_for_court"]:
         return (
             "%sREADY FOR TIER 4 (court). All %d applicable remedy levers attempted + logged: %s."
@@ -230,4 +289,43 @@ if __name__ == "__main__":
     assert r4["ready_for_court"] is False, "T4: stray attempt must not satisfy an owed lever"
     assert r4["missing"] == ["pre_suit_notice"], "T4: real lever still owed"
 
-    print("\nPASS — court is structurally unreachable until every applicable remedy lever is attempted + logged.")
+    # --- Test 5 (2026-07-28): AN EMPTY MAP FAILS CLOSED, IN THE LIBRARY ---------------
+    # The original set arithmetic made an empty map the most permissive input possible:
+    # empty required -> empty missing -> ready_for_court True. Nothing in this module's own
+    # self-tests exercised it, and only two of its callers remembered to guard for it.
+    for empty in ([], (), set(), ["", "  "], None or []):
+        r5 = remedy_complete(empty, [])
+        assert r5["ready_for_court"] is False, \
+            "T5: an EMPTY remedy map must NEVER open court (got %r)" % r5
+        assert r5["no_map"] is True, "T5: an empty map must be reported as no_map"
+    r5b = remedy_complete([], ["tier1_vendor", "state_ag", "bbb"])
+    assert r5b["ready_for_court"] is False, \
+        "T5: attempted levers cannot open court when the map itself is empty"
+    print("\n=== Test 5: empty map fails CLOSED in the library ===")
+    print(summarize([], [], case="MER-EMPTY"))
+
+    # --- Test 6: a map made of NOTHING BUT court levers is also an empty map ----------
+    r6 = remedy_complete(["tier4_court", "small_claims"], [])
+    assert r6["ready_for_court"] is False and r6["no_map"] is True, \
+        "T6: court-only map has no prerequisites enumerated — fail closed"
+
+    # --- Test 7: hand-written court keys are recognised as COURT, not as owed levers --
+    # MER-76's live map said `small_claims_dallas`. Unrecognised, it became an ordinary
+    # required lever: court owed before court, permanently unreachable.
+    assert is_court_lever("small_claims_dallas"), "small_claims_dallas is the court destination"
+    assert is_court_lever("tier4_court_tx") and is_court_lever("court")
+    assert not is_court_lever("state_ag") and not is_court_lever("bbb")
+    assert not is_court_lever(""), "an empty key is not a court lever"
+    r7 = remedy_complete(["tier1_vendor", "small_claims_dallas"], ["tier1_vendor"])
+    assert r7["ready_for_court"] is True, \
+        "T7: court must not be a prerequisite for itself, however the key is spelled"
+    assert "small_claims_dallas" not in r7["missing"], "T7: court key never appears as owed"
+    print("\n=== Test 7: venue-suffixed court keys cannot gate court on itself ===")
+    print(r7)
+
+    # --- Test 8: magnuson_moss is a lever the vocabulary knows (so it is satisfiable) --
+    assert "magnuson_moss" in LEVER_LABELS, \
+        "T8: a lever appearing in real maps must be known, or it can never be satisfied"
+
+    print("\nPASS — court is structurally unreachable until every applicable remedy lever is attempted + logged, "
+          "an EMPTY map fails closed, and court is never a prerequisite for itself.")

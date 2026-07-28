@@ -66,9 +66,18 @@ def send_html(token: str, chat_id: str, text: str):
         return False, str(e)
 
 
-def main():
+def run_and_send(generator=None):
+    """Run `generator` (default: the whole-business /dashboard), send its stdout to Telegram.
+
+    Parameterized so a second report (merchandise-return-dashboard) reuses this exact delivery
+    path instead of a second copy of the Telegram-send logic -- see send_mer_dashboard.py.
+    Telegram caps a message at 4096 chars; truncated to 4000 for margin. A report with many
+    verbose cases can exceed this -- known limitation, not solved here (out of scope for what
+    was asked; revisit with pagination if a real report actually gets cut off).
+    """
+    gen = generator or GEN
     result = subprocess.run(
-        [sys.executable, GEN],
+        [sys.executable, gen],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
@@ -91,6 +100,11 @@ def main():
         return 0
     print(f"ERROR: telegram send failed: {info}", file=sys.stderr)
     return 4
+
+
+def main():
+    override = sys.argv[1] if len(sys.argv) > 1 else None
+    return run_and_send(override)
 
 
 if __name__ == "__main__":

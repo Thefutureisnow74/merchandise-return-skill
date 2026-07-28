@@ -23,28 +23,72 @@
   "version": 1,
 
   "defaults": {
-    "log_max_lines": 500,
-    "schedule_timezone": "host local time",
+    "log_max_lines": 5000,
+    "schedule_timezone": "UTC",
+    "business_timezone_intent": "America/Chicago",
     "_schedule_note": [
-      "Every 'schedule' below is a 5-field cron expression interpreted in the HOST'S LOCAL TIME",
-      "ZONE, because that is what cron, systemd and Task Scheduler all do by default and a clock",
-      "that silently disagrees with the wall clock is worse than no clock. The times were chosen",
-      "as business-hours-local: an alert is only worth as much as the correction that follows it,",
-      "and corrections happen while a human is awake."
+      "EVERY 'schedule' BELOW IS UTC. This changed on 2026-07-28 and the reason matters.",
+      "",
+      "The manifest used to say the expressions were 'host local time' and to write them as if",
+      "the host were on US Central: mer-engine was '0 8-17 * * 1-5', described as '08:00-17:00",
+      "Mon-Fri'. The host it actually runs on is a container whose local time IS UTC (`date` and",
+      "`date -u` agree). So the engine really ran 03:00-12:00 America/Chicago and was ASLEEP FOR",
+      "THE ENTIRE US BUSINESS AFTERNOON. Worst case, a vendor replying at 12:01pm CT on a Friday",
+      "was not processed until 03:00am CT on Monday — about 63 hours — while every tier deadline",
+      "in the ladder ran against that clock. A schedule and a description that disagree with",
+      "reality are worse than no schedule, because they stop anyone from looking.",
+      "",
+      "WHY UTC AND NOT A TIMEZONE SETTING. Setting TZ per job would be the better fix — it is",
+      "DST-proof — but scheduler.py has no timezone concept: it hands the cron expression",
+      "verbatim to crontab/systemd/Task Scheduler, all of which interpret it in the host's local",
+      "zone, and a TZ in a job's `env` reaches only the CHILD PROCESS, never the moment the",
+      "clock fires. Rather than ship a `tz` field that silently does nothing, the expressions are",
+      "UTC — which is what the deployment host actually uses — and every 'schedule_human' below",
+      "states the real UTC time AND the CT time it lands on in both halves of the year.",
+      "",
+      "DST. US Central is UTC-5 in summer (CDT) and UTC-6 in winter (CST), so a fixed UTC",
+      "expression drifts by one hour across the two changeovers. Every window below is therefore",
+      "widened by one hour so the intended Central business day is fully covered YEAR-ROUND; the",
+      "cost is one extra hour of coverage in one half of the year, which for jobs that read mail",
+      "and compute deadlines is free. The one job where the extra hour would matter — draining",
+      "the send queue — is bounded on both ends so it can never run outside daylight in either",
+      "offset. Single-instant daily jobs simply shift by an hour between summer and winter; that",
+      "is stated per job and is acceptable for quantities measured in days.",
+      "",
+      "IF YOU RUN THIS ON A NON-UTC HOST, translate every expression below into your host's own",
+      "local zone, and fix 'schedule_human' at the same time. A description that no longer",
+      "matches its expression is the bug this note exists to prevent."
+    ],
+    "_log_note": [
+      "log_max_lines was 500 and the hand-written wrappers used 400, which meant a traceback",
+      "from the every-minute hot path was rolled out of existence within the hour — the forensic",
+      "record of a bad night was gone before anyone woke up. It is 5000 here, and separately",
+      "every FAILURE is appended to an UNBOUNDED error log (heartbeat.py's `mer_errors.log`,",
+      "beside the heartbeat file) that nothing ever truncates. Bounded logs are for reading;",
+      "the error log is for evidence."
     ]
   },
 
   "jobs": [
     {
       "name": "mer-engine",
-      "schedule": "0 8-17 * * 1-5",
-      "schedule_human": "hourly, 08:00-17:00, Mon-Fri (local)",
+      "schedule": "0 13-22 * * 1-5",
+      "schedule_human": "hourly at :00, 13:00-22:00 UTC Mon-Fri = 08:00-17:00 CT in summer (CDT), 07:00-16:00 CT in winter (CST)",
       "description": "The inbound->action loop: read new mail, classify, draft, then process the veto queue.",
       "why_on_a_clock": [
         "This is the engine proper. Vendor mail arrives on the vendor's schedule, not the user's,",
         "and every tier deadline in the ladder runs against the clock from the moment a reply lands.",
         "Business hours only: a draft queued at 3am cannot be vetoed by a sleeping human, and the",
-        "veto window is the only thing standing between a machine-written letter and a real vendor."
+        "veto window is the only thing standing between a machine-written letter and a real vendor.",
+        "",
+        "THE HOUR RANGE IS UTC (see defaults._schedule_note). It was '8-17' with a comment that",
+        "called it business hours, on a host whose local time is UTC — so it ran 03:00-12:00 CT",
+        "and the engine slept through every US business afternoon. 13-22 UTC is EXACTLY the",
+        "intended 08:00-17:00 Central under CDT; under CST it lands an hour early (07:00-16:00",
+        "CT), which is the unavoidable one-hour DST drift of a fixed UTC expression. The winter",
+        "16:00-17:00 CT hour is not a hole in coverage: mer-hotpath watches the mailbox EVERY",
+        "MINUTE, 24/7, and dispatches this same engine the moment a reply lands. This hourly job",
+        "is the backstop behind that, not the primary detector."
       ],
       "env_from_file": [
         "MULTICA_TOKEN",
@@ -77,16 +121,85 @@
         "That matters more than it looks: two concurrent runs produce two different LLM drafts, so",
         "two different body fingerprints, and idempotency.reserve() would permit BOTH. The lock is",
         "what makes the pair safe -- do not revert this step while mer-hotpath is scheduled.",
-        "send_queue.py --process stays HERE and only here. It is the only thing that drains the",
-        "queue, so a draft queued at 3am physically cannot leave before business hours."
+        "",
+        "send_queue.py --process ALSO runs here, but it is no longer the ONLY place it runs; see",
+        "the mer-send-queue job below. It used to be, and that turned the veto window into a lie:",
+        "a letter drafted at 11:50am CT with a 3-hour window was 'due' at 2:50pm CT and did not",
+        "actually leave until the next drain -- which, with the broken schedule above, was 03:00am",
+        "the following Monday. 61 hours late, still quoting a deadline computed on Friday. Keeping",
+        "the step here as well is deliberate redundancy: if the frequent drain job is ever removed,",
+        "the queue still drains rather than silently filling up forever."
       ],
       "stdout": { "mode": "silent" }
     },
 
     {
+      "name": "mer-send-queue",
+      "schedule": "*/10 13-22 * * *",
+      "schedule_human": "every 10 minutes, 13:00-22:59 UTC daily = 08:00-17:59 CT in summer (CDT), 07:00-16:59 CT in winter (CST)",
+      "description": "Drain the veto queue: send every queued letter whose veto window has actually expired.",
+      "why_on_a_clock": [
+        "THE VETO WINDOW MUST MEAN WHAT IT SAYS. A queued letter carries a promise -- 'this goes",
+        "out in 3 hours unless you cancel it' -- and that promise is only kept if something looks",
+        "at the queue shortly after those 3 hours are up. Until now the only drain was bolted to",
+        "the hourly mer-engine job, so the real send time was 'the next business-hours engine run',",
+        "which over a weekend was up to 61 hours after the letter was due. A letter that arrives",
+        "two days late still quoting the deadline it was written against is worse than no letter:",
+        "it tells the vendor the deadline is not real.",
+        "",
+        "WHY IT IS STILL BOUNDED TO DAYLIGHT. The other half of the original design was sound: a",
+        "draft queued at 3am cannot be vetoed by a sleeping human, so nothing may LEAVE the",
+        "machine overnight. This job therefore runs frequently but only inside 13:00-22:59 UTC,",
+        "which is daytime in Central under BOTH DST offsets. The hot path still queues 24/7 and",
+        "still cannot drain (mer_hotpath refuses structurally, see FORBIDDEN_DISPATCH); an",
+        "overnight draft simply waits for the morning, which is what a human would expect.",
+        "",
+        "IT RUNS SEVEN DAYS A WEEK ON PURPOSE. A letter queued Friday afternoon with a 3-hour",
+        "window is due Friday evening; draining only Mon-Fri would hold it until Monday morning",
+        "and reintroduce the exact delay this job exists to remove. Saturday morning delivery of",
+        "an escalation letter is normal and harmless; a 61-hour delay is not."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL",
+        "MER_PROFILE",
+        "MER_GOOGLE_TOKEN_FILE",
+        "MER_SENDER"
+      ],
+      "env": {
+        "MER_ENGINE_SEND": "test",
+        "MER_ENGINE_WINDOW_HOURS": "3"
+      },
+      "env_notes": [
+        "MER_ENGINE_SEND must match the mer-engine job. This job does not decide whether to send;",
+        "it decides whether a letter that was ALREADY approved for sending has finished waiting."
+      ],
+      "log": "send_queue.log",
+      "steps": [
+        { "module": "send_queue.py", "args": ["--process"], "output": "alert" },
+        { "module": "heartbeat.py",
+          "args": ["--beat", "mer-send-queue", "--expect", "1800", "--detail", "queue drained"],
+          "output": "log" }
+      ],
+      "step_notes": [
+        "The heartbeat step proves THE JOB RAN, not that the drain succeeded -- the scheduler runs",
+        "every step regardless of the previous step's exit code, so this beat is a liveness signal",
+        "only. Whether the drain itself worked is carried by the first step's own exit code, which",
+        "the 'alert' stdout mode below escalates via fail_rc_above."
+      ],
+      "stdout": {
+        "mode": "alert",
+        "footer": "(the veto window on each of these had already expired)",
+        "fail_rc_above": 0,
+        "fail_message": "send_queue --process exited {rc} - the veto queue did not drain, so approved letters are sitting unsent while their deadlines run."
+      }
+    },
+
+    {
       "name": "mer-hotpath",
       "schedule": "* * * * *",
-      "schedule_human": "every minute (local), 24/7",
+      "schedule_human": "every minute, 24/7 (timezone-independent)",
       "description": "Event-driven hot path: watch the mailbox cursor and fire the engine the moment a reply lands.",
       "why_on_a_clock": [
         "The hourly engine job means a vendor reply can sit unnoticed for an hour, and from Friday",
@@ -114,19 +227,81 @@
         "deliberately never sets the send gate itself.",
         "MER_HOTPATH_MIN_INTERVAL / MAX_INTERVAL / BACKOFF only affect --run-forever, not this job.",
         "On a host with no minute-granularity cron, drop this job and run",
-        "'mer_hotpath.py --run-forever' under a supervisor instead."
+        "'mer_hotpath.py --run-forever' under a supervisor instead.",
+        "",
+        "env_from_file IS LOAD-BEARING AND WAS THE 2026-07-28 OUTAGE. The dispatched mer_engine",
+        "child inherits this job's environment; without MULTICA_TOKEN in it, every dispatch died",
+        "with 'GET /properties -> 401: missing authorization' while the minute loop itself kept",
+        "reporting rc=0 and 'idle - no mailbox change' 1439 times a day. If your scheduler config",
+        "does not set an env file (scheduler.py's --env-file / MER_SCHED_ENV_FILE), these keys",
+        "resolve to nothing. mer_hotpath.py now also reads the shared .env itself as a belt-and-",
+        "braces measure (MER_ENV_FILE, default <data dir>/.env) -- but SET THE ENV FILE ANYWAY."
       ],
       "log": "mer_hotpath.log",
       "steps": [
         { "module": "mer_hotpath.py", "args": [], "output": "log" }
       ],
+      "step_notes": [
+        "mer_hotpath writes its own heartbeat on every tick -- idle, dispatching, or crashing --",
+        "so no separate beat step is needed here. A failed dispatch also REWINDS the mailbox",
+        "cursor, so the mail that triggered the failure is retried on the next tick instead of",
+        "being skipped forever."
+      ],
       "stdout": { "mode": "silent" }
     },
 
     {
+      "name": "mer-heartbeat",
+      "schedule": "*/10 * * * *",
+      "schedule_human": "every 10 minutes, 24/7 (timezone-independent)",
+      "description": "The watchdog's watchdog: compare every component's last heartbeat to its own cadence and alert on a missed beat, a failure, or a non-zero exit.",
+      "why_on_a_clock": [
+        "Every other job in this manifest is SILENT WHEN HEALTHY, which is the right design for",
+        "output and a catastrophic one for liveness: it makes 'nothing is wrong' and 'nothing is",
+        "running' produce identical evidence. This engine has failed that way at least four times",
+        "(2026-07-18, 07-20, 07-26, 07-28). The canonical shape is an expired credential: every",
+        "per-case query throws, the exception handler prints one line and continues, and the run",
+        "finishes by printing 'done. 0 HIGH item(s)' -- which is exactly what a quiet week prints,",
+        "while deadlines pass on every open case.",
+        "",
+        "So liveness gets its own channel. Every scheduled component writes {name, ts, ok, err} on",
+        "EVERY tick, success and failure alike, into one heartbeat file; this job is the only",
+        "thing that READS that file, and it speaks up on three conditions and no others: a beat",
+        "that did not arrive when it was due, a beat that says ok:false, and a non-zero exit code.",
+        "A component that is broken can no longer report itself green, because the write that",
+        "reports green is the same write that would have carried the error.",
+        "",
+        "Ten minutes is chosen against the fastest cadence being watched (the one-minute hot path,",
+        "which is allowed to miss five minutes before it counts as missing) and against the",
+        "slowest useful human response. Alerts de-duplicate per component per condition with an",
+        "hour of cooldown, so a component broken overnight wakes you a few times, not 144.",
+        "",
+        "Components that only run in business hours declare an active window in their own beat,",
+        "and this checker ignores them outside it -- otherwise it would report the engine missing",
+        "every night and be muted within a week."
+      ],
+      "env_from_file": ["MER_PROFILE"],
+      "env": {},
+      "env_notes": [
+        "The Telegram bot token is read from the shared secrets file by the alerter itself and is",
+        "deliberately not listed as a job variable; WHO gets alerted comes from the profile."
+      ],
+      "log": "heartbeat.log",
+      "steps": [
+        { "module": "heartbeat.py", "args": ["--check"], "output": "alert" }
+      ],
+      "stdout": {
+        "mode": "alert",
+        "footer": "(component health; the alert itself has already been pushed)",
+        "fail_rc_above": 1,
+        "fail_message": "heartbeat --check exited {rc} - THE HEALTH CHECKER ITSELF IS BROKEN. Nothing is watching the engine until this is fixed."
+      }
+    },
+
+    {
       "name": "mer-case-tick",
-      "schedule": "0 9 * * *",
-      "schedule_human": "daily at 09:00 (local)",
+      "schedule": "0 14 * * *",
+      "schedule_human": "daily at 14:00 UTC = 09:00 CT in summer (CDT), 08:00 CT in winter (CST)",
       "description": "The daily case tick: walk every open case, compute what is due, surface only what needs a human.",
       "why_on_a_clock": [
         "Deadlines pass whether or not any mail arrives. The tick is the only job that fires on the",
@@ -146,7 +321,13 @@
       },
       "log": "case_tick.log",
       "steps": [
-        { "module": "case_tick.py", "args": ["--live"], "output": "log+match" }
+        { "module": "case_tick.py", "args": ["--live"], "output": "log+match" },
+        { "module": "heartbeat.py", "args": ["--beat", "mer-case-tick", "--expect", "108000", "--detail", "daily tick ran"], "output": "log" }
+      ],
+      "step_notes": [
+        "The heartbeat step proves the daily tick RAN. Without it, a case-tick that silently stopped",
+        "firing would be indistinguishable from a week in which no case needed action -- both produce",
+        "no output at all, which is this manifest's definition of healthy."
       ],
       "stdout": {
         "mode": "match",
@@ -158,8 +339,8 @@
 
     {
       "name": "mer-calendar-sync",
-      "schedule": "30 9 * * *",
-      "schedule_human": "daily at 09:30 (local)",
+      "schedule": "30 14 * * *",
+      "schedule_human": "daily at 14:30 UTC = 09:30 CT in summer (CDT), 08:30 CT in winter (CST)",
       "description": "Mirror each open case's phase deadline onto its due date, then upsert one all-day calendar event per dated case.",
       "why_on_a_clock": [
         "Two steps, in order, because the calendar reads the due date the first step writes.",
@@ -185,8 +366,8 @@
 
     {
       "name": "mer-delivery-check",
-      "schedule": "0 8,12,16 * * *",
-      "schedule_human": "08:00, 12:00 and 16:00 daily (local)",
+      "schedule": "0 13,17,21 * * *",
+      "schedule_human": "13:00, 17:00 and 21:00 UTC daily = 08:00/12:00/16:00 CT in summer (CDT), 07:00/11:00/15:00 CT in winter (CST)",
       "description": "Post-send bounce sweep. Read-only: reads the send ledger and the mailbox, sends nothing.",
       "why_on_a_clock": [
         "Sending reports success the moment the mail server accepts the message for relay. A message",
@@ -212,8 +393,8 @@
 
     {
       "name": "mer-sol-watchdog",
-      "schedule": "0 10 * * 1",
-      "schedule_human": "Mondays at 10:00 (local)",
+      "schedule": "0 15 * * 1",
+      "schedule_human": "Mondays at 15:00 UTC = 10:00 CT in summer (CDT), 09:00 CT in winter (CST)",
       "description": "Statute-of-limitations sweep. Read-only: reads the board and prints, writes nothing.",
       "why_on_a_clock": [
         "Every other deadline in the engine is our own. The statute of limitations is the OUTER clock,",
@@ -239,8 +420,8 @@
 
     {
       "name": "mer-unmatched-review",
-      "schedule": "30 10 * * 1",
-      "schedule_human": "Mondays at 10:30 (local)",
+      "schedule": "30 15 * * 1",
+      "schedule_human": "Mondays at 15:30 UTC = 10:30 CT in summer (CDT), 09:30 CT in winter (CST)",
       "description": "Weekly missed-mail sweep: return-related inbound that matched no live case query. Read-only.",
       "why_on_a_clock": [
         "The engine matches inbound to a case by a per-case mailbox query. That is precise but narrow,",

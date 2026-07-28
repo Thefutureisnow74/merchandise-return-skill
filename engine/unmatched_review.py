@@ -59,6 +59,43 @@ from datetime import datetime, timezone
 # reuse the self-refreshing read token the rest of the engine uses
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/data/scripts")
+
+
+def _install_selftest_profile():
+    """Plant a throwaway profile so --selftest is genuinely OFFLINE and identity-free.
+
+    SELF = mer_config.email() resolves at IMPORT time, so `--selftest` died with "no profile
+    configured" (exit 1) on any machine without one. It only ever passed in the canonical
+    scripts directory because that directory happens to contain a profile.json — i.e. the
+    self-test was silently borrowing the operator's identity, and the byte-identical copy in
+    the shipped skill package failed. A self-test that needs a configured identity is not a
+    self-test.
+
+    Same pattern as fresh_profile_check.py: write a fictional profile to a temp dir and point
+    $MER_PROFILE at it. Done BEFORE the mer_config import below, because that is when the
+    module-level identity constants are resolved. Unconditional during --selftest, so the
+    result is identical in canonical and in the package.
+    """
+    import json as _json
+    import tempfile as _tempfile
+    d = _tempfile.mkdtemp(prefix="mer_unmatched_selftest_")
+    path = os.path.join(d, "profile.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        _json.dump({
+            "legal_name": "Priya N. Raman",
+            "email": "priya.raman@example.net",
+            "state": "Rhode Island",
+            "county": "Providence",
+            "multica_workspace_id": "ffffffff-0000-4444-8888-cccccccccccc",
+            "notify": {"channel": "none"},
+            "google_token_file": os.path.join(d, "selftest_google_token.json"),
+        }, fh)
+    os.environ["MER_PROFILE"] = path
+
+
+if "--selftest" in sys.argv:
+    _install_selftest_profile()
+
 import gmail_transport as _gt  # noqa: E402
 import mer_config              # noqa: E402  (M32 — identity from the profile, not a literal)
 

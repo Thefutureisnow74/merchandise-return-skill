@@ -67,6 +67,10 @@ import businessday                # noqa: E402
 import remedy_gate                # noqa: E402
 import remedy_map                 # noqa: E402
 import idempotency                # noqa: E402
+# resolution_check is the module that exists PRECISELY to reject brush-offs ("we've escalated
+# internally"). Until 2026-07-28 case_tick never imported it, so the reply-hold treated every
+# inbound alike and a brush-off held the ladder shut exactly as hard as a real resolution.
+import resolution_check           # noqa: E402
 
 BUILD_PROJECT = "13805886-7b4d-45bf-b985-32128f91b288"  # engine-build milestones — skip
 CASE_TITLE_HINTS = ("Case:", "CLIENT:", "SELF:")
@@ -136,14 +140,35 @@ ADVANCING_CODES = {"ADVANCE", "DUE", "OVERDUE"}
 # party on someone else's behalf without their written authorization. Widen, never narrow.
 CLIENT_TITLE_PREFIX = "CLIENT:"
 CLIENT_DESC_MARKER = "CLIENT CASE"
+# How much of the description the marker may hide in. Bounded so a stray mention deep in a
+# long thread transcript cannot flip an ordinary case; the marker is a header convention and
+# lives in the opening block.
+CLIENT_MARKER_SCAN_CHARS = 500
 AFFIRMATIVE = {"yes", "true", "y", "1", "client", "client case", "on", "checked", "✓"}
 
-# ---- substantive-reply detection (M44) -------------------------------------------------
-# Description blocks in which a vendor reply is logged. Advancement means "the window lapsed
-# in silence"; a reply logged AFTER the current phase's outbound means it did not.
+# ---- substantive-reply detection (M44; rebuilt 2026-07-28) -----------------------------
+# THE GATE THAT WAS A NO-OP. This block used to be read ONLY out of the issue description
+# (a REPLIES:/RECEIVED:/… block) or an "MR …Replied" property. Nothing in the tree ever WROTE
+# either one, and no such property existed on the board — so vendor_reply_hold() returned
+# (False, "") on 100% of live cases and the gate had never once fired. MER-2 (Nike) would have
+# auto-escalated on 2026-08-05 with a physical exchange in transit, and MER-76 on 2026-08-03
+# mid-thread with the vendor.
+#
+# The primary signal is now the board property `MR Last Vendor Reply` (date), written by the
+# inbound classifier for SUBSTANTIVE inbound only — autoresponders and delivery receipts do
+# not count. The description blocks remain as a fallback so a hand-kept case record still works.
+LAST_REPLY_PROP = "MR Last Vendor Reply"
 REPLY_BLOCKS = ("REPLIES", "REPLY", "RECEIVED", "VENDOR REPLY", "INBOUND")
 SENT_BLOCK = "SENT"
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# The remedy the case is demanding, used to judge whether a reply actually DELIVERED it.
+REMEDY_TYPE_PROP = "MR Remedy Type"
+
+# NO HOLD MAY BE PERMANENT. A hold with no timeout is just a different way to strand a case:
+# the ladder stops, nothing escalates, and nobody is told. After this many business days the
+# hold either lapses (unclassifiable) or converts into a named human action (resolved).
+REPLY_HOLD_MAX_BUSINESS_DAYS = 10
 
 
 def truthy(v):
@@ -175,7 +200,13 @@ def is_client_case(issue):
     issue = issue or {}
     if (issue.get("title") or "").strip().upper().startswith(CLIENT_TITLE_PREFIX):
         return True
-    if (issue.get("description") or "").lstrip().upper().startswith(CLIENT_DESC_MARKER):
+    # CONTAINMENT, not startswith (fixed 2026-07-28). The old test only looked at the FIRST
+    # characters of the description, and MER-4's description opens "NEEDS-KING: re-send the
+    # intake questions to Kim…" with "CLIENT CASE —" on line 3 — so the marker signal missed
+    # entirely and the case was caught only by its title prefix. One convention short of a
+    # third-party contact being opened without written authorization. The docstring above says
+    # "widen, never narrow"; a prefix test is the narrowest possible reading of it.
+    if CLIENT_DESC_MARKER in (issue.get("description") or "")[:CLIENT_MARKER_SCAN_CHARS].upper():
         return True
     for name, val in (issue.get("mr") or {}).items():
         if "client" in str(name).lower() and _affirmative(val):
@@ -207,40 +238,151 @@ def _latest_date(text):
     return best
 
 
-def vendor_reply_hold(desc, mr=None):
-    """(hold: bool, why: str) — did the vendor answer this phase's outbound?
+def _to_date(v):
+    """ISO date / datetime string -> date, else None."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if not v:
+        return None
+    try:
+        return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
 
-    An advancement asserts the counterparty went silent for the whole window. If the case
-    record logs a reply NEWER than the most recent outbound, it did not, and a human decides
-    what the reply means before a new channel is opened.
 
-    Signals, in order:
-      * an affirmative `MR Vendor Replied`-style property (opt-in; absent from the default
-        schema, so this costs nothing on a stock board);
-      * a REPLIES/RECEIVED/… block whose newest date is >= the newest date in the SENT block.
-    A reply block with dates but a SENT block with none is held (fail-safe): we cannot show
-    the reply is stale, and holding only costs a manual escalation.
-    Clearing a hold is a human action: log the newer outbound in SENT, or clear the block.
+def vendor_reply_hold(desc, mr=None, today=None):
+    """Did the vendor answer this phase's outbound, and does that answer hold the ladder?
+
+    Returns a dict:
+        {"hold": bool, "why": str, "disposition": str, "flag_human": bool,
+         "reply_at": date|None, "resolved": bool}
+    `disposition` ∈ {"none", "stale", "resolved", "brush_off", "unclassifiable", "expired"}.
+
+    THE LOGIC IS NOT "ANY REPLY HOLDS" — that was the second half of the defect. The
+    documented ladder rule is that "escalated internally" is NOT resolution (workspace rule
+    #4). A brush-off is precisely the reply that SHOULD escalate; holding on it hands the
+    vendor a free, unlimited stall by return of post. So:
+
+        resolved       -> HOLD, and route toward close_case (never toward a new tier)
+        brush-off      -> DO NOT HOLD; the ladder climbs, which is the whole point of it
+        unclassifiable -> HOLD and FLAG A HUMAN (we cannot read it; a person must)
+        stale reply    -> no hold (it predates this phase's outbound)
+
+    Signals for "there is a reply", in order of authority:
+      1. the `MR Last Vendor Reply` DATE property — written by the inbound classifier for
+         SUBSTANTIVE inbound only (autoresponders and delivery receipts are excluded there);
+      2. an affirmative `MR …Replied`-style property (opt-in legacy signal);
+      3. a REPLIES/RECEIVED/… description block whose newest date is >= the SENT block's.
+
+    NO HOLD IS PERMANENT. Past REPLY_HOLD_MAX_BUSINESS_DAYS an unclassifiable hold LAPSES
+    (disposition "expired") so a case cannot be parked forever by one unreadable email, and a
+    resolved hold stops being silent — it keeps holding (advancing a resolved case into a new
+    escalation tier is never right) but flags a named human action: close it or reopen it.
     """
-    for name, val in (mr or {}).items():
+    today = today or businessday.today()
+    mr = mr or {}
+    out = {"hold": False, "why": "", "disposition": "none", "flag_human": False,
+           "reply_at": None, "resolved": False}
+
+    # ---- 1. the authoritative property -------------------------------------------------
+    reply_at = _to_date(mr.get(LAST_REPLY_PROP))
+    source = "%s = %s" % (LAST_REPLY_PROP, reply_at) if reply_at else ""
+
+    # ---- 2. legacy affirmative flag ----------------------------------------------------
+    flag_prop = None
+    for name, val in mr.items():
         n = str(name).lower()
-        if "replied" in n or "reply received" in n:
-            if _affirmative(val):
-                return True, "%s is affirmative — a vendor reply is on record" % name
+        if ("replied" in n or "reply received" in n) and _affirmative(val):
+            flag_prop = name
+            break
+
+    # ---- 3. description fallback -------------------------------------------------------
     reply_txt = " ".join(_block(desc, lab) for lab in REPLY_BLOCKS).strip()
-    if not reply_txt:
-        return False, ""
-    reply_at = _latest_date(reply_txt)
-    if not reply_at:
-        return False, ""
+    desc_at = _latest_date(reply_txt) if reply_txt else None
     sent_at = _latest_date(_block(desc, SENT_BLOCK))
-    if sent_at is None:
-        return True, ("a vendor reply is logged (%s) and the record has no dated %s line to "
-                      "show it is stale — holding" % (reply_at, SENT_BLOCK))
-    if reply_at >= sent_at:
-        return True, ("a vendor reply dated %s is newer than this phase's outbound (%s) — the "
-                      "window did not lapse in silence; a human reads the reply" % (reply_at, sent_at))
-    return False, ""
+
+    if desc_at and (reply_at is None or desc_at > reply_at):
+        # A description-logged reply only counts if it is not demonstrably older than this
+        # phase's outbound. Unknown SENT date -> fail safe and treat it as current.
+        if sent_at is None or desc_at >= sent_at:
+            reply_at = desc_at
+            source = ("%s block dated %s%s"
+                      % ("/".join(REPLY_BLOCKS[:2]), desc_at,
+                         "" if sent_at is None else " (outbound %s)" % sent_at))
+        elif reply_at is None and not flag_prop:
+            out["disposition"] = "stale"
+            out["why"] = ("the only logged reply (%s) predates this phase's outbound (%s) — "
+                          "the window did lapse in silence" % (desc_at, sent_at))
+            return out
+
+    if reply_at is None and not flag_prop:
+        return out
+
+    out["reply_at"] = reply_at
+    if flag_prop and not source:
+        source = "%s is affirmative" % flag_prop
+
+    # ---- classify the reply: resolution, brush-off, or unreadable ----------------------
+    demanded = str(mr.get(REMEDY_TYPE_PROP) or "refund")
+    verdict = resolution_check.rule_based(demanded, reply_txt)
+    reason = verdict.get("reason") or ""
+    if reply_txt and verdict.get("resolved"):
+        disposition = "resolved"
+    elif reply_txt and (reason.startswith("Brush-off:") or reason.startswith("DODGE:")):
+        disposition = "brush_off"
+    else:
+        disposition = "unclassifiable"
+
+    age_ok = True
+    if reply_at is not None:
+        age_ok = businessday.business_day_deadline(reply_at, REPLY_HOLD_MAX_BUSINESS_DAYS) >= today
+
+    if disposition == "brush_off":
+        out.update({
+            "hold": False, "disposition": "brush_off",
+            "why": ("a vendor reply is on record (%s) but it is a BRUSH-OFF, not a "
+                    "resolution — %s. 'Escalated internally' is not resolution; a brush-off "
+                    "does not hold the ladder." % (source, reason)),
+        })
+        return out
+
+    if disposition == "resolved":
+        out.update({
+            "hold": True, "resolved": True, "disposition": "resolved",
+            "flag_human": not age_ok,
+            "why": ("the vendor reply on record (%s) DELIVERS the demanded %s — %s. The case "
+                    "routes toward close_case, never toward a new escalation tier.%s"
+                    % (source, demanded, reason,
+                       "" if age_ok else
+                       " HUMAN ACTION REQUIRED: this resolution is more than %d business days old and "
+                       "the case is still open — close it (close_case.py --confirm-close) or "
+                       "reopen it; it must not sit here silently."
+                       % REPLY_HOLD_MAX_BUSINESS_DAYS)),
+        })
+        return out
+
+    # unclassifiable — we cannot read it, so a human must, but not forever.
+    if not age_ok:
+        out.update({
+            "hold": False, "disposition": "expired", "flag_human": True,
+            "why": ("a vendor reply was on record (%s) that could not be classified, and the "
+                    "hold has now exceeded %d business days — the hold LAPSES rather than "
+                    "stranding the case. A human should read that reply."
+                    % (source, REPLY_HOLD_MAX_BUSINESS_DAYS)),
+        })
+        return out
+    out.update({
+        "hold": True, "disposition": "unclassifiable", "flag_human": True,
+        "why": ("a vendor reply is on record (%s) that the classifier could not call a "
+                "resolution OR a brush-off (%s) — holding, and FLAGGING FOR A HUMAN. "
+                "Escalating to a new channel over the top of a live conversation is a "
+                "person's decision, not a timer's. Hold lapses after %d business days."
+                % (source, reason or "no reply text available to classify",
+                   REPLY_HOLD_MAX_BUSINESS_DAYS)),
+    })
+    return out
 
 
 def _levers(v):
@@ -267,7 +409,8 @@ def decide(phase, deadline, intake_done, awaiting_yes, today):
             return "INTAKE", "awaiting the user's answers; no auto-advance until MR Intake Complete=true"
         return "ADVANCE", "intake complete — advance %s -> %s" % (phase, NEXT_PHASE.get(phase, "?"))
     if not deadline:
-        return "NO-DEADLINE", "%s with no MR Phase Deadline set — arm the clock" % phase
+        return "NO-DEADLINE", ("%s with no MR Phase Deadline set — arming the clock "
+                               "(nothing used to; see arm_deadline)" % phase)
     d = (deadline - today).days
     nxt = NEXT_PHASE.get(phase, "?")
     if d > 3:
@@ -292,7 +435,7 @@ def gate_check(case, today=None):
     Returns (allowed: bool, target_phase: str|None, deadline: date|None, reason: str).
     Every refusal names the rule it is enforcing.
     """
-    today = today or date.today()
+    today = today or businessday.today()
     phase = case.get("phase")
     status = (case.get("status") or "").lower()
 
@@ -338,29 +481,88 @@ def gate_check(case, today=None):
             return False, None, None, "%s deadline %s has not elapsed (%dd left)" % (
                 phase, deadline, (deadline - today).days)
 
-        # GATE 3b — the window must have lapsed IN SILENCE. A substantive vendor reply logged
-        # after this phase's outbound means the counterparty engaged; escalating to a new
-        # channel over the top of a live conversation is a human's call, not a timer's.
-        held, why = vendor_reply_hold(case.get("description"), case.get("mr"))
-        if held:
-            return False, None, None, "substantive vendor reply on record — %s" % why
+        # GATE 3b — the window must have lapsed IN SILENCE, and "silence" is judged by what
+        # the reply actually SAID. A resolution holds (and routes to close); a brush-off does
+        # NOT hold (that is what the ladder is for); an unreadable reply holds AND flags a
+        # human, with a timeout so no hold can be permanent.
+        h = vendor_reply_hold(case.get("description"), case.get("mr"), today)
+        if h["hold"]:
+            return False, None, None, "vendor reply on record (%s) — %s%s" % (
+                h["disposition"], h["why"], "  [FLAG FOR HUMAN]" if h["flag_human"] else "")
+
+    # GATE 3c — A CASE MAY NOT LEAVE RemedyMap WITH AN EMPTY MAP.
+    # Tier 0 is the phase whose entire job is producing the map, and nothing stopped a case
+    # walking straight out of it with the property blank. GATE 4 only ever fired on the last
+    # hop (target == Tier4), and nothing re-ran Tier 0, so MER-1 (Tier3), MER-2 (Tier1) and
+    # MER-3 (Tier2) all left RemedyMap empty and became PERMANENTLY unable to reach court —
+    # each of them due to burn 45 business days at PreSuit before anything said so.
+    rmap = case.get("remedy_map") or []
+    if phase == REMEDY_MAP_PHASE and not rmap:
+        return False, None, None, (
+            "%s is empty and this case is AT %s — the phase whose only job is to produce it. "
+            "Leaving here with a blank map makes Tier 4 structurally unreachable for the rest "
+            "of the case's life, so the hop is refused until Tier 0 runs (case_tick --live "
+            "builds it, or remedy_map.py by hand)." % (REMEDY_MAP_PROP, REMEDY_MAP_PHASE))
+
+    # GATE 3d — THE MAP IS VALIDATED ON READ, EVERY HOP.
+    # remedy_map.write() validated its own writes, but most live maps were typed in by hand
+    # and this side read the property as free text. MER-76's map contained four keys unknown
+    # to remedy_gate (log_attempt refuses them by design, so they could NEVER be satisfied)
+    # plus `small_claims_dallas` — court as an owed prerequisite for court. An unsatisfiable
+    # map is a LOUD refusal, never a silent forever-hold: the problem and its fix are named.
+    if rmap:
+        ok_map, problems = remedy_map.validate_map(rmap)
+        if not ok_map:
+            suggested, _ = remedy_map.normalize_map(rmap)
+            return False, None, None, (
+                "UNSATISFIABLE %s -- REFUSING TO ADVANCE. %s || The map as written can never "
+                "clear the court gate, so advancing would walk this case toward a Tier 4 it "
+                "can never reach. Suggested corrected map: %s"
+                % (REMEDY_MAP_PROP, remedy_map.describe_problems(problems),
+                   remedy_map.serialize(suggested) or "(rebuild with Tier 0)"))
 
     # GATE 4 — court is structurally unreachable until the remedy map is exhausted.
-    if target in COURT_PHASES:
-        rmap = case.get("remedy_map") or []
-        if not rmap:
-            return False, None, None, (
-                "entering %s requires a Tier-0 remedy map; %s is empty — failing CLOSED "
-                "(no map means the levers were never enumerated, not that none apply)"
-                % (target, REMEDY_MAP_PROP))
+    # remedy_complete() is now evaluated on EVERY advance, not only on the last hop, so a
+    # case learns what it still owes from Tier 1 onward instead of discovering it after
+    # 45 business days at PreSuit. It only BLOCKS when the target is court.
+    owed = ""
+    if phase not in ("Intake", "CaseFile", REMEDY_MAP_PHASE):
         r = remedy_gate.remedy_complete(rmap, case.get("remedy_attempted") or [])
-        if not r["ready_for_court"]:
-            return False, None, None, "remedy_gate: %d lever(s) still owed before %s: %s" % (
-                len(r["missing"]), target, ", ".join(r["missing"]))
+        if r.get("no_map"):
+            owed = "  [remedy map EMPTY — Tier 4 unreachable until Tier 0 runs]"
+        elif r["missing"]:
+            owed = "  [still owed before Tier 4: %s]" % ", ".join(r["missing"])
+        if target in COURT_PHASES and not r["ready_for_court"]:
+            return False, None, None, (
+                "remedy_gate holds %s: %s" % (target, r["reason"]))
 
     sla = PHASE_SLA_DAYS.get(target)
     new_deadline = businessday.business_day_deadline(today, sla) if sla else None
-    return True, target, new_deadline, "gates cleared — %s -> %s" % (phase, target)
+    return True, target, new_deadline, "gates cleared — %s -> %s%s" % (phase, target, owed)
+
+
+def tracked_cases(issues):
+    """The subset of `issues` this engine treats as live merchandise-return cases.
+
+    Factored out of main()'s loop so a second consumer (mer_dashboard.py) filters the exact same
+    way case_tick itself does, instead of re-implementing the rule and risking the two drifting —
+    the same class of bug M33 killed for Gmail queries (two hand-synced tables, one wrong).
+    A case is tracked iff: not done/cancelled, not a build-project housekeeping issue, not a
+    sweep/system/milestone title, and it carries a non-empty MR Phase.
+    """
+    out = []
+    for it in issues:
+        status = it.get("status") or ""
+        title = it.get("title") or ""
+        if status in ("done", "cancelled"):
+            continue
+        if it.get("project_id") == BUILD_PROJECT:
+            continue
+        if title.startswith("Daily case sweep") or title.startswith(("KING:", "SYSTEM:", "M1 ", "M2 ")):
+            continue
+        if (it.get("mr", {}) or {}).get(PHASE_PROP):
+            out.append(it)
+    return out
 
 
 def case_view(issue):
@@ -522,6 +724,79 @@ def advance(issue, view, target, new_deadline, mer16_id=None, defs=None):
         view["phase"], target, new_deadline, "; awaiting-YES set" if red else "", detail)
 
 
+def arm_deadline(issue, view, today=None, mer16_id=None, defs=None):
+    """Arm `MR Phase Deadline` on a tier phase that has none. LIVE ONLY.
+
+    THE TERMINAL STALL THIS FIXES (2026-07-28). decide() has always returned
+    NO-DEADLINE "…arm the clock" — and nothing armed one. advance() is the ONLY writer of
+    MR Phase Deadline anywhere in the tree, and it is unreachable from this code path, so a
+    tier phase with no deadline sat in NO-DEADLINE forever: GATE 3 refuses to advance
+    ("clock not armed, nothing elapsed"), no nudge fires (nudge.due_nudges skips a case with
+    no parseable deadline), and no report says the case is stuck. Telling evidence that this
+    is the normal state and not an edge case: `MR Awaiting User YES` had usage_count 0
+    workspace-wide before 2026-07-28, meaning case_tick has never actually advanced a case
+    into a tier in production — every tier phase on the board was set BY HAND, which is
+    exactly how a phase ends up with no deadline.
+
+    The clock is armed from the phase's own outbound where the record shows one (the SENT
+    block's newest date), else from today. Arming from SENT is the honest reading: the window
+    started when the letter went, not when the engine noticed. That can produce an
+    already-elapsed deadline — which is correct, and the case advances on the NEXT tick
+    through the normal gates rather than jumping two states at once here.
+
+    Writes ONLY the deadline. It never touches MR Phase and never sets awaiting-YES, so this
+    can never be a disguised advancement. Verified by read-back, idempotent, RECORD-ONLY log.
+    """
+    today = today or businessday.today()
+    ident = view["identifier"]
+    phase = view["phase"]
+    sla = PHASE_SLA_DAYS.get(phase)
+    if not sla:
+        return False, "no SLA defined for phase %r — nothing to arm" % phase
+    sent_at = _latest_date(_block(view.get("description"), SENT_BLOCK))
+    base = sent_at or today
+    new_deadline = businessday.business_day_deadline(base, sla)
+
+    ok, key = idempotency.reserve(ident, "arm_deadline:%s" % phase, "board",
+                                  str(new_deadline),
+                                  meta={"phase": phase, "deadline": str(new_deadline),
+                                        "anchored_on": str(base)})
+    if not ok:
+        return False, "deadline already armed (idempotency key %s) — no re-arm" % key
+
+    values = {DEADLINE_PROP: new_deadline.isoformat()}
+    try:
+        mc.set_properties(issue, values, defs=defs)
+    except Exception as e:
+        _release_reservation(key)
+        return False, ("arming the clock FAILED (%s: %s) — reservation released, the next "
+                       "tick retries. Nothing was written." % (type(e).__name__, e))
+    try:
+        verified, detail = verify_written(issue["id"], values, defs)
+    except Exception as e:
+        verified, detail = False, "read-back itself failed (%s: %s)" % (type(e).__name__, e)
+    if not verified:
+        _release_reservation(key)
+        return False, ("CLOCK NOT ARMED — %s. Reservation released; the next tick retries."
+                       % detail)
+
+    view["deadline"] = new_deadline
+    note = ("RECORD ONLY - NO ACTION REQUIRED [re %s]. %s was blank at phase %s, which is a "
+            "terminal stall: no gate can elapse, no nudge fires, and nothing reports it. The "
+            "clock is now armed to %s = %d business days from %s (%s). No phase change, no "
+            "outbound, no approval flag was touched."
+            % (ident, DEADLINE_PROP, phase, new_deadline, sla, base,
+               "the newest dated %s line on the record" % SENT_BLOCK if sent_at else "today"))
+    target_issue = (mer16_id if (issue.get("assignee_type") == "agent" and mer16_id) else issue["id"])
+    try:
+        mc.add_comment(target_issue, note)
+    except Exception as e:
+        return True, "clock armed to %s, but the RECORD-ONLY log failed: %s" % (new_deadline, e)
+    return True, "clock armed: %s = %s (%d business days from %s; %s)" % (
+        DEADLINE_PROP, new_deadline, sla, base,
+        "anchored on the SENT record" if sent_at else "anchored on today")
+
+
 def build_remedy_map(issue, view, mer16_id=None, defs=None):
     """TIER 0 — build and persist this case's remedy map. LIVE ONLY; callers gate on --live.
 
@@ -562,8 +837,13 @@ def build_remedy_map(issue, view, mer16_id=None, defs=None):
 
 def main():
     live = "--live" in sys.argv
-    today = date.today()
+    # USER-TIMEZONE TODAY, not the container's. The VPS container runs UTC, where date.today()
+    # is already TOMORROW from 19:00 America/Chicago onward — every evening tick would judge
+    # deadlines a day early and could fire an escalation a full day before it was due.
+    today = businessday.today()
     print("=== case_tick (VPS/API)  %s  (%s) ===" % (today.isoformat(), "LIVE" if live else "DRY-RUN"))
+    print("today resolved in %s (container clock is UTC — never date.today() here)"
+          % businessday.profile_timezone())
     print("runtime: 24/7 VPS via api.multica.ai (laptop-independent, M20)\n")
 
     issues = mc.list_issues()
@@ -579,7 +859,9 @@ def main():
     except Exception:
         mer16 = None
     defs = mc.name_to_defs() if live else None
-    tracked, untracked, advanced, mapped = [], [], [], []
+    tracked_issues = tracked_cases(issues)
+    tracked_ids = {it.get("id") for it in tracked_issues}
+    tracked, untracked, advanced, mapped, armed, flagged = [], [], [], [], [], []
     for it in issues:
         status = it.get("status") or ""
         title = it.get("title") or ""
@@ -591,14 +873,19 @@ def main():
             continue
         p = it.get("mr", {})
         phase = p.get(PHASE_PROP)
-        if phase:
+        if it.get("id") in tracked_ids:
             v = case_view(it)
             code, action = decide(phase, v["deadline"], v["intake_done"], v["awaiting_yes"], today)
             note = ""
-            # --- TIER 0: a case sitting at RemedyMap with an empty map gets one built ---
-            # Runs BEFORE advancement so the map exists before the case leaves the phase that
-            # is supposed to produce it. Dry-run writes NOTHING.
-            if phase == REMEDY_MAP_PHASE and not v["remedy_map"]:
+            # --- TIER 0: ANY tracked case with an empty map gets one built ---
+            # This used to fire ONLY at phase == RemedyMap. Nothing blocked a case leaving
+            # RemedyMap on a blank map and nothing ever re-ran Tier 0, so MER-1 (Tier3),
+            # MER-2 (Tier1) and MER-3 (Tier2) sat past the phase with empty maps and Tier 4
+            # permanently unreachable — and the tick had no code path that could ever notice.
+            # Runs BEFORE advancement so the map exists before the case moves. Dry-run writes
+            # NOTHING. build() itself refuses to emit an empty map, so a case it cannot map
+            # is reported rather than papered over.
+            if not v["remedy_map"] and phase not in NEVER_WRITE_PHASES:
                 if not live:
                     note = ("would BUILD the Tier-0 remedy map (%s is empty) "
                             "— dry-run, nothing written" % REMEDY_MAP_PROP)
@@ -610,6 +897,26 @@ def main():
                     note = ("REMEDY MAP: " if built else "remedy map not written: ") + msg
                     if built:
                         mapped.append((v["identifier"], v["remedy_map"]))
+            # --- NO-DEADLINE is a terminal stall: arm the clock ---
+            # decide() has always SAID "arm the clock" and nothing ever did. See arm_deadline().
+            if code == "NO-DEADLINE":
+                pre = note + " | " if note else ""
+                if not live:
+                    note = pre + ("would ARM %s from the %s record (or today) — dry-run, "
+                                  "nothing written" % (DEADLINE_PROP, SENT_BLOCK))
+                else:
+                    try:
+                        done, msg = arm_deadline(it, v, today, mer16_id=mer16, defs=defs)
+                    except Exception as e:
+                        done, msg = False, "arm FAILED: %s" % e
+                    note = pre + ("CLOCK ARMED: " if done else "clock not armed: ") + msg
+                    if done:
+                        armed.append((v["identifier"], v["phase"], v["deadline"]))
+            # --- a reply we cannot classify is surfaced even when nothing else happens ---
+            if v["phase"] not in ("Intake", "CaseFile"):
+                _h = vendor_reply_hold(v.get("description"), v.get("mr"), today)
+                if _h["flag_human"]:
+                    flagged.append((v["identifier"], _h["disposition"], _h["why"]))
             # --- M37: the ladder climbs ---
             if code in ADVANCING_CODES:
                 pre = note + " | " if note else ""   # keep the Tier-0 line; never overwrite it
@@ -648,20 +955,33 @@ def main():
     # in --live, and every enqueue still passes the idempotency guard + the send-mode gate.
     # Runs AFTER advancement so a case that just climbed carries its fresh deadline and is not
     # also nudged on the phase it has already left.
-    if live and any(code == "NUDGE" for _, _, code, _, _ in tracked):
+    # CALLED UNCONDITIONALLY under --live (fixed 2026-07-28). It used to run only if SOME
+    # case in this walk emitted NUDGE — but enqueue_due() re-walks the whole board itself, so
+    # whether case X got nudged depended on whether an unrelated case Y happened to be in its
+    # Day-3 window on the same day. That coupling is invisible and produces missed follow-ups
+    # that look like nothing at all. enqueue_due is independently idempotent (queue record +
+    # send ledger), so calling it every tick is safe and is the only honest wiring.
+    if live:
         try:
             import nudge  # noqa: E402
             nudge.enqueue_due(today)
         except Exception as e:
             print("  (nudge enqueue failed: %s)" % e)
 
-    print("\nsummary: %d tracked, %d need onboarding, %d advanced, %d remedy map(s) built. %s" %
-          (len(tracked), len(untracked), len(advanced), len(mapped),
+    print("\nsummary: %d tracked, %d need onboarding, %d advanced, %d remedy map(s) built, "
+          "%d clock(s) armed, %d reply flag(s). %s" %
+          (len(tracked), len(untracked), len(advanced), len(mapped), len(armed), len(flagged),
            "dry-run — nothing written." if not live else "live."))
     for ident, frm, to, dl in advanced:
         print("  advanced %-8s %s -> %s (deadline %s)" % (ident, frm, to, dl))
     for ident, levers in mapped:
         print("  Tier-0 map %-8s %s" % (ident, ", ".join(levers)))
+    for ident, ph, dl in armed:
+        print("  clock armed %-8s %s -> %s" % (ident, ph, dl))
+    if flagged:
+        print("\n-- VENDOR REPLIES NEEDING A HUMAN (RECORD ONLY - NO ACTION REQUIRED) --")
+        for ident, disp, why in flagged:
+            print("  ! %-8s [%s] %s" % (ident, disp, why))
 
 
 # ---------------------------------------------------------------- self-test
@@ -786,7 +1106,7 @@ def _selftest():
         return False
 
     main_fn = next(nd for nd in tree.body if isinstance(nd, ast.FunctionDef) and nd.name == "main")
-    for fname in ("advance", "build_remedy_map"):
+    for fname in ("advance", "build_remedy_map", "arm_deadline"):
         calls = [nd for nd in ast.walk(main_fn)
                  if isinstance(nd, ast.Call) and getattr(nd.func, "id", None) == fname]
         check("%s() is called at all (a self-test is not a wired module)" % fname,
@@ -919,6 +1239,172 @@ def _selftest():
     check("build_remedy_map() is only reachable under --live",
           "if not live:" in src and "build_remedy_map(it, v," in src, True,
           "dry-run branch precedes the write branch in main()")
+
+    # =====================================================================================
+    # 2026-07-28 — the state-machine gate fixes. Every case below is the REAL live shape.
+    # =====================================================================================
+
+    # 17. THE REPLY-HOLD GATE IS NO LONGER A NO-OP, and it is no longer inverted.
+    print("\n-- 17. reply hold: reads the board property, and judges what the reply SAID --")
+    # 17a. the property alone holds — this is the signal the old code had no way to see.
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday,
+                                  mr={LAST_REPLY_PROP: "2026-07-27"}), today)
+    check("MR Last Vendor Reply (the new property) HOLDS the gate", a, False, r,
+          "vendor reply on record" in r)
+    # 17b. a BRUSH-OFF does NOT hold. This is the inversion fix: "escalated internally is not
+    #      resolution", so the reply that most deserves escalation must not block it.
+    brush = ("VENDOR/ITEM: Acme.\n\nSENT:\nTier 1 letter 2026-07-10\n\nREPLIES:\n"
+             "2026-07-24 Acme: thank you for your patience, we have escalated this "
+             "internally and our team will get back to you.\n")
+    h = vendor_reply_hold(brush, {LAST_REPLY_PROP: "2026-07-24"}, today)
+    check("a BRUSH-OFF does not hold the ladder", h["hold"], False,
+          h["why"], h["disposition"] == "brush_off")
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday, description=brush,
+                                  mr={LAST_REPLY_PROP: "2026-07-24"}), today)
+    check("...so the case still climbs Tier1 -> Tier2 over a brush-off", a, True, r, t == "Tier2")
+    # 17c. a REAL resolution holds and routes toward close, never toward a new tier.
+    good = ("VENDOR/ITEM: Acme.\n\nSENT:\nTier 1 letter 2026-07-10\n\nREPLIES:\n"
+            "2026-07-24 Acme: a refund of $249.00 has been issued to your card.\n")
+    h = vendor_reply_hold(good, {LAST_REPLY_PROP: "2026-07-24",
+                                 REMEDY_TYPE_PROP: "refund"}, today)
+    check("a REAL resolution holds and routes toward close_case", h["hold"], True,
+          h["why"], h["resolved"] is True and "close_case" in h["why"])
+    # 17d. an unreadable reply holds AND flags a human.
+    murky = ("SENT:\nTier 1 letter 2026-07-10\n\nREPLIES:\n"
+             "2026-07-24 Acme sent a message about the order.\n")
+    h = vendor_reply_hold(murky, {LAST_REPLY_PROP: "2026-07-24"}, today)
+    check("an UNCLASSIFIABLE reply holds AND flags a human", h["hold"], True, h["why"],
+          h["flag_human"] is True and h["disposition"] == "unclassifiable")
+    # 17e. NO HOLD IS PERMANENT — the unclassifiable hold lapses on a timeout.
+    old_reply = today - timedelta(days=60)
+    h = vendor_reply_hold(murky.replace("2026-07-24", old_reply.isoformat()),
+                          {LAST_REPLY_PROP: old_reply.isoformat()}, today)
+    check("an unclassifiable hold LAPSES after the timeout (no permanent hold)",
+          h["hold"], False, h["why"],
+          h["disposition"] == "expired" and h["flag_human"] is True)
+    # 17f. resolution_check is actually imported and used — the module that exists to reject
+    #      brush-offs was never imported by this file before today.
+    check("resolution_check is wired into the hold (not merely documented)",
+          "resolution_check" in src and "resolution_check.rule_based(" in src, True,
+          "the brush-off detector is on the code path")
+
+    # 18. A CASE CANNOT LEAVE RemedyMap WITH AN EMPTY MAP.
+    print("\n-- 18. RemedyMap may not be left empty; court stays reachable --")
+    a, t, d, r = gate_check(_case(phase="RemedyMap", deadline=yday, remedy_map=[]), today)
+    check("RemedyMap -> Tier1 REFUSED on an empty map", a, False, r,
+          "structurally unreachable" in r)
+    a, t, d, r = gate_check(_case(phase="RemedyMap", deadline=yday,
+                                  remedy_map=["tier1_vendor", "bbb"]), today)
+    check("RemedyMap -> Tier1 allowed once the map exists", a, True, r, t == "Tier1")
+    # ...and `missing` is surfaced from Tier1 onward, not only at the last hop.
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday,
+                                  remedy_map=["tier1_vendor", "state_ag", "bbb"],
+                                  remedy_attempted=["tier1_vendor"]), today)
+    check("owed levers are surfaced at Tier1, not discovered at PreSuit", a, True, r,
+          "still owed before Tier 4" in r and "bbb" in r)
+    a, t, d, r = gate_check(_case(phase="Tier2", deadline=yday, remedy_map=[]), today)
+    check("an empty map is CALLED OUT on every hop past RemedyMap", a, True, r,
+          "remedy map EMPTY" in r)
+    # the Tier-0 build is no longer restricted to cases sitting at RemedyMap.
+    check("Tier 0 is triggered by an EMPTY MAP, not by the phase",
+          'if not v["remedy_map"] and phase not in NEVER_WRITE_PHASES:' in src, True,
+          "MER-1/2/3 were all past RemedyMap with empty maps and unreachable")
+
+    # 19. HAND-WRITTEN MAPS ARE VALIDATED ON READ — the real MER-76 map.
+    print("\n-- 19. an unsatisfiable hand-written map is a LOUD refusal, not a silent hold --")
+    mer76 = ["tier1_vendor", "tier2_exec", "state_ag", "texas_dtpa", "bbb_southwest",
+             "magnuson_moss", "small_claims_dallas"]
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday, remedy_map=mer76), today)
+    check("MER-76's live map REFUSES to advance", a, False, r, "UNSATISFIABLE" in r)
+    check("...and the refusal names the circular court key", "small_claims_dallas" in r, True,
+          "court cannot be a prerequisite for court")
+    check("...and names the unsatisfiable keys", "texas_dtpa" in r and "bbb_southwest" in r,
+          True, "log_attempt() refuses unknown keys by design")
+    check("...and prints the corrected map so the refusal is actionable",
+          "Suggested corrected map" in r, True, "a loud refusal, never a silent forever-hold")
+    a, t, d, r = gate_check(_case(phase="Tier1", deadline=yday,
+                                  remedy_map=remedy_map.normalize_map(mer76)[0]), today)
+    check("the normalised map advances cleanly", a, True, r, t == "Tier2")
+
+    # 20. remedy_gate FAILS CLOSED ON AN EMPTY MAP IN THE LIBRARY (not just in callers).
+    check("remedy_gate.remedy_complete([], []) does NOT open court",
+          remedy_gate.remedy_complete([], [])["ready_for_court"], False,
+          "the guard lives in the library now")
+
+    # 21. NO-DEADLINE IS NO LONGER A TERMINAL STALL.
+    print("\n-- 21. a tier phase with no clock gets one armed --")
+    code, action = decide("Tier1", None, True, False, today)
+    check("a tier phase with no deadline reports NO-DEADLINE", code, "NO-DEADLINE", action)
+    idempotency.LEDGER = ledger = os.path.join(tempfile.gettempdir(), "mer_ledger_arm_test.json")
+    if os.path.exists(ledger):
+        os.remove(ledger)
+    board2 = {PHASE_PROP: "Tier1"}
+    real_set, real_get, real_comment = mc.set_properties, mc.get_issue, mc.add_comment
+    logged = []
+    try:
+        mc.set_properties = lambda issue, values, ws=None, defs=None: board2.update(values)
+        mc.get_issue = lambda iid, ws=None: {"id": iid, "properties": {}, "mr": dict(board2)}
+        mc.add_comment = lambda iid, content, ws=None: logged.append(content)
+        v = _case(phase="Tier1", deadline=None,
+                  description="SENT:\nTier 1 letter on 2026-07-20\n")
+        done, msg = arm_deadline({"id": "t"}, v, today, defs={})
+        want_arm = businessday.business_day_deadline(date(2026, 7, 20), PHASE_SLA_DAYS["Tier1"])
+        check("the clock is armed from the SENT record", done, True, msg,
+              board2.get(DEADLINE_PROP) == want_arm.isoformat())
+        check("...arming NEVER changes the phase or sets awaiting-YES",
+              board2.get(PHASE_PROP) == "Tier1" and YES_PROP not in board2, True,
+              "board now: %s" % board2)
+        check("...and it is logged RECORD-ONLY",
+              bool(logged) and "RECORD ONLY - NO ACTION REQUIRED" in logged[0], True,
+              "a comment on a live-agent issue is read as an instruction (workspace rule #1)")
+        done2, msg2 = arm_deadline({"id": "t"}, v, today, defs={})
+        check("...and re-arming the same clock is refused (idempotent)", done2, False, msg2,
+              "already armed" in msg2)
+        # with no SENT record it anchors on today
+        if os.path.exists(ledger):
+            os.remove(ledger)
+        board2.pop(DEADLINE_PROP, None)
+        v2 = _case(phase="Tier2", deadline=None, description="no outbound logged")
+        done3, msg3 = arm_deadline({"id": "t2"}, v2, today, defs={})
+        check("with no SENT line the clock anchors on today", done3, True, msg3,
+              board2.get(DEADLINE_PROP) ==
+              businessday.business_day_deadline(today, PHASE_SLA_DAYS["Tier2"]).isoformat())
+    finally:
+        mc.set_properties, mc.get_issue, mc.add_comment = real_set, real_get, real_comment
+        if os.path.exists(ledger):
+            os.remove(ledger)
+
+    # 22. THE CLIENT-CASE MARKER IS FOUND ANYWHERE IN THE OPENING BLOCK (MER-4's real shape).
+    # Fixture shape is real; the name is not. A self-test that carries a real client's
+    # name ships that name to every recipient of this package — the publish gate caught
+    # exactly this on 2026-07-28. Fixtures use fictional people.
+    mer4_desc = ('NEEDS-OWNER: re-send the intake questions to the client. Their 2026-07-18 '
+                 'email arrived EMPTY.\n\nCLIENT CASE — first external client of the '
+                 'merchandise-return service.\n\nCLIENT: Jordan Rivera')
+    check("the 'CLIENT CASE' marker is found on line 3, not just at offset 0",
+          is_client_case({"title": "Jordan Rivera - tablet", "description": mer4_desc}), True,
+          "MER-4's description opens with NEEDS-KING:; startswith() missed it entirely")
+    check("...while an ordinary case is still not a client case",
+          is_client_case({"title": "Case: Acme", "description": "VENDOR/ITEM: Acme."}), False,
+          "the widening does not swallow self cases")
+
+    # 23. TIMEZONE — no deadline decision may use the container's UTC date.
+    # AST, not a substring, so this check cannot be fooled by its own message.
+    _utc_today_calls = [nd for nd in ast.walk(tree)
+                        if isinstance(nd, ast.Call)
+                        and isinstance(nd.func, ast.Attribute) and nd.func.attr == "today"
+                        and isinstance(nd.func.value, ast.Name) and nd.func.value.id == "date"]
+    check("case_tick never calls the container-clock today() for a decision",
+          len(_utc_today_calls), 0,
+          "businessday.today() resolves the USER's today (UTC rolls over at 19:00 CT)")
+    check("gate_check defaults 'today' to the profile timezone",
+          "today = today or businessday.today()" in src, True, "one source of 'today'")
+
+    # 24. NUDGE COUPLING — enqueue_due() re-walks the whole board, so it must not be
+    #     conditional on some OTHER case happening to emit NUDGE in this walk.
+    check("nudge.enqueue_due is called unconditionally under --live",
+          'if live:\n        try:\n            import nudge' in src, True,
+          "whether case X is nudged no longer depends on case Y")
 
     if fails:
         print("\nFAIL — %d gate(s) wrong: %s" % (len(fails), ", ".join(fails)))

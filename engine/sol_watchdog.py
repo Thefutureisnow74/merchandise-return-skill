@@ -48,6 +48,7 @@ import sys
 from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import businessday  # noqa: E402  — "today" in the USER's timezone, never the UTC container's
 
 # ---------------------------------------------------------------------------------------
 # SoL data (conservative; every entry is verify=True). See disclaimer above.
@@ -163,6 +164,37 @@ _MONTHS = {m: i for i, m in enumerate(
 _WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
              "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
+# ---------------------------------------------------------------------------------------
+# 2026-07-28 — THE WATCHDOG FABRICATED PRECISE DATES IN BOTH DIRECTIONS.
+#
+# Executed against the real board, MER-3's PURCHASE line read:
+#     'PURCHASE/DATES: King (2026-07-26) says "about 2 years ago or so" (~2024)'
+# The parser took the LEFTMOST date in the window — 2026-07-26, the date King SPOKE — and
+# passed its precise=True flag straight through, reporting 729 days of runway on a ~2024
+# Texas claim that is at or past its 2-year DTPA limit. A FALSE ALL-CLEAR on a possibly
+# time-barred case is the most dangerous output this module can produce.
+#
+# Four structural guards, all below:
+#   (a) a hedge anywhere in the matched window forces precise=False;
+#   (b) an anchor LATER than the issue's own created_at is rejected outright — a purchase
+#       cannot post-date the case file that describes it;
+#   (c) a MM-01 / Jan-1 value is treated as a probable PLACEHOLDER unless corroborated;
+#   (d) two materially competing dates emit AMBIGUOUS instead of a number.
+HEDGE_RE = re.compile(
+    r"approximate\w*|approx\.?|about|around|roughly|~|or so|circa|ish\b|est\.|estimated?|"
+    r"unsure|not sure|believe|think it was|somewhere",
+    re.I)
+
+# Two candidate dates this far apart are not "the same fact stated twice" — they are
+# competing claims about when the purchase happened, and picking one is a guess.
+AMBIGUITY_SPAN_DAYS = 365
+
+# A date landing exactly on 1 January (or on the 1st of a month derived from YYYY-MM) is far
+# more often a placeholder than a real purchase date — MER-76 carries MR Purchase Date
+# 2022-01-01 and MR Discovery Date 2023-01-01, both written as placeholders.
+def _is_placeholder_date(d):
+    return d is not None and d.month == 1 and d.day == 1
+
 
 def _to_date(v):
     """Coerce a date/datetime/ISO-string into a date, else None."""
@@ -173,6 +205,8 @@ def _to_date(v):
     if not v:
         return None
     s = str(v).strip()
+    # No trailing \b: an API timestamp is "2026-07-17T20:40:25Z" and the digit->T junction is
+    # not a word boundary, so a \b here would silently fail to parse every created_at.
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         try:
@@ -182,28 +216,20 @@ def _to_date(v):
     return None
 
 
-def parse_date_from_text(text, today=None):
-    """Best-effort extraction of a purchase/incident date from free text.
+def _date_candidates(text, today=None):
+    """Every date this text could be claiming, as [(start, end, -specificity, date, precise, matched)].
 
-    Returns (date, precise_bool, matched_str) or None. precise=False means the value is
-    APPROXIMATE (year-only, year-month, or 'N years ago') and rounded to the EARLIEST
-    plausible day so the SoL alert fires conservatively (earlier rather than later).
-
-    IMPORTANT: a case description often names several dates on one line (e.g. Nike's
-    'PURCHASE/DATES: ~2025-01 ... verified in chat 2026-07-17'). The purchase date is
-    stated FIRST, so we pick the LEFTMOST date match — never the most-specific-anywhere,
-    which would wrongly latch onto a later chat/refund date. Ties at the same position go
-    to the more specific pattern (a real month/day beats a bare year at that spot).
+    Factored out (2026-07-28) so the picker and the ambiguity check see ONE candidate list.
+    They did not before, and the ambiguity check counted the bare-year match that OVERLAPS a
+    full 'May 11 2026' as a second, competing date — making every precise date look disputed.
     """
-    if not text:
-        return None
-    today = today or date.today()
-    t = str(text)
-    cands = []  # (start_pos, -specificity, date, precise, matched)
+    today = today or businessday.today()
+    t = str(text or "")
+    cands = []
 
     def add(mo, d, precise, spec):
         if d is not None:
-            cands.append((mo.start(), -spec, d, precise, mo.group(0)))
+            cands.append((mo.start(), mo.end(), -spec, d, precise, mo.group(0)))
 
     # full ISO  YYYY-MM-DD (specific, precise)
     for mo in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", t):
@@ -231,7 +257,7 @@ def parse_date_from_text(text, today=None):
             add(mo, date(int(mo[1]), int(mo[2]), 1), False, 2)
         except ValueError:
             pass
-    # 'N years ago/old' — digits (approx). Relative dates are meaningful, rank above bare year.
+    # 'N years ago/old' - digits (approx). Relative dates are meaningful, rank above bare year.
     for mo in re.finditer(r"\b(\d{1,2})\s*(?:year|yr)s?\s*(?:ago|old)\b", t, re.I):
         add(mo, _add_years(today, -int(mo[1])), False, 3)
     # spelled-out 'two years ago' (approx)
@@ -241,11 +267,85 @@ def parse_date_from_text(text, today=None):
     for mo in re.finditer(r"\b(?:19|20)\d{2}\b", t):
         add(mo, date(int(mo[0]), 1, 1), False, 1)
 
+    cands.sort()  # leftmost start first; then higher specificity (via -spec)
+    return cands
+
+
+def _competing_dates(cands):
+    """The DISTINCT dates the text really claims: the chosen one plus every non-overlapping
+    candidate. A bare '2026' sitting INSIDE 'May 11 2026' is the same fact re-matched, not a
+    rival claim, so it must not make a precise date look disputed."""
+    if not cands:
+        return []
+    c0 = cands[0]
+    out = [c0[3]]
+    for st, en, _spec, d, _p, _m in cands[1:]:
+        if en <= c0[0] or st >= c0[1]:        # no overlap with the chosen match
+            out.append(d)
+    return sorted(set(out))
+
+
+def parse_date_from_text(text, today=None):
+    """Best-effort extraction of a purchase/incident date from free text.
+
+    Returns (date, precise_bool, matched_str) or None. precise=False means the value is
+    APPROXIMATE (year-only, year-month, 'N years ago', OR hedged/disputed in the text) and
+    rounded to the EARLIEST plausible day so the SoL alert fires conservatively.
+
+    IMPORTANT: a case description often names several dates on one line (e.g. Nike's
+    'PURCHASE/DATES: ~2025-01 ... verified in chat 2026-07-17'). The purchase date is
+    stated FIRST, so we pick the LEFTMOST date match - never the most-specific-anywhere,
+    which would wrongly latch onto a later chat/refund date. Ties at the same position go
+    to the more specific pattern (a real month/day beats a bare year at that spot).
+
+    (a) A HEDGE ANYWHERE IN THE WINDOW FORCES precise=False. "about 2 years ago or so",
+    "approximately May 15, 2024", "~2025-01": the writer told us the value is an estimate.
+    Letting precise=True through is how an estimate is later reported as a known fact - and
+    this module's output is "your claim may be time-barred". So is a second, competing date.
+    """
+    if not text:
+        return None
+    cands = _date_candidates(text, today)
     if not cands:
         return None
-    cands.sort()  # leftmost start first; then higher specificity (via -spec)
-    _pos, _spec, d, precise, matched = cands[0]
+    _st, _en, _spec, d, precise, matched = cands[0]
+    if HEDGE_RE.search(str(text)) or len(_competing_dates(cands)) > 1:
+        precise = False
     return d, precise, matched
+
+
+def parse_dates_detail(text, today=None):
+    """Full picture of the dates in a chunk of text - what parse_date_from_text hides.
+
+    Returns None when there is no date at all, else:
+        {"date", "precise", "matched", "hedged", "ambiguous", "candidates", "why"}
+
+    `ambiguous` is True when two NON-OVERLAPPING candidate dates are more than
+    AMBIGUITY_SPAN_DAYS apart: those are competing claims about WHEN, and choosing the
+    leftmost is a coin flip dressed up as an answer. Callers must emit AMBIGUOUS rather than
+    a number. This is MER-3's line exactly: a 2026-07-26 speaking date beside a "~2024"
+    purchase estimate, from which the old parser confidently returned 2026-07-26.
+    """
+    if not text:
+        return None
+    cands = _date_candidates(text, today)
+    if not cands:
+        return None
+    _st, _en, _spec, d, precise, matched = cands[0]
+    hedged = bool(HEDGE_RE.search(str(text)))
+    distinct = _competing_dates(cands)
+    span = (distinct[-1] - distinct[0]).days if len(distinct) > 1 else 0
+    ambiguous = span > AMBIGUITY_SPAN_DAYS
+
+    why = []
+    if hedged:
+        why.append("the text hedges the value")
+    if ambiguous:
+        why.append("%d competing dates %s span %d days"
+                   % (len(distinct), [x.isoformat() for x in distinct], span))
+    return {"date": d, "precise": bool(precise) and not hedged and len(distinct) == 1,
+            "matched": matched, "hedged": hedged, "ambiguous": ambiguous,
+            "candidates": distinct, "why": "; ".join(why)}
 
 
 def extract_case_date(issue, today=None):
@@ -263,6 +363,27 @@ def extract_case_date(issue, today=None):
     the structured field is exactly how a precise=False estimate becomes a precise=True fact.
     """
     mr = issue.get("mr", {}) or {}
+    desc_all = issue.get("description") or ""
+    filed = _to_date(issue.get("created_at"))          # the case file's own birthday
+
+    def _guard(d, precise, source):
+        """(b) + (c): reject impossible anchors, demote placeholders. Returns a 3-tuple or None."""
+        if d is None:
+            return None
+        # (b) A PURCHASE CANNOT POST-DATE ITS OWN CASE FILE. MER-3 anchored on 2026-07-26 —
+        # the date King SPOKE about the purchase, nine days AFTER the case was opened — and
+        # reported it as precise. Any anchor later than created_at is not a purchase date.
+        if filed and d > filed:
+            return None, False, ("REJECTED %s: %s post-dates the case file (created %s) — a "
+                                 "purchase cannot happen after the case describing it"
+                                 % (source, d, filed))
+        # (c) Jan-1 is a placeholder far more often than it is a purchase date. It is only
+        # believed when the description states that exact date in full somewhere.
+        if _is_placeholder_date(d) and d.isoformat() not in desc_all:
+            return d, False, ("%s — PROBABLE PLACEHOLDER (%s is a bare Jan-1 value with no "
+                              "corroborating mention in the record; treat as approximate and "
+                              "capture the real date)" % (source, d))
+        return d, precise, source
 
     # 1a) THE DISCOVERY RULE COMES FIRST. Under many state consumer statutes (TX DTPA among them)
     # the limitations clock can run from when the consumer discovered — or reasonably should have
@@ -271,25 +392,49 @@ def extract_case_date(issue, today=None):
     # time-barred", so erring that way tells someone to give up on a claim that is still live.
     # Real example: MER-3's sprayer was bought ~2023 but "failed after only 6 uses", so discovery
     # is plausibly recent even though purchase is three years back.
+    rejected = []
     d = _to_date(mr.get("MR Discovery Date"))
     if d:
-        return d, True, "property 'MR Discovery Date' (discovery-rule anchor)"
+        g = _guard(d, True, "property 'MR Discovery Date' (discovery-rule anchor)")
+        if g and g[0] is not None:
+            return g
+        if g:
+            rejected.append(g[2])
 
     # 1b) otherwise the purchase/incident anchor — the conservative reading.
     for key in ("MR Purchase Date", "MR Incident Date", "MR SoL Date", "MR Purchase/Incident Date"):
         d = _to_date(mr.get(key))
         if d:
-            return d, True, "property '%s' (purchase/incident anchor)" % key
+            g = _guard(d, True, "property '%s' (purchase/incident anchor)" % key)
+            if g and g[0] is not None:
+                return g
+            if g:
+                rejected.append(g[2])
 
-    desc = issue.get("description") or ""
+    desc = desc_all
 
     # 2) the 'PURCHASE/DATES:' line specifically (avoids matching 'sent 2026-07-17' etc.)
     mline = re.search(r"PURCHASE[/ ]?DATES?\s*:?(.+)", desc, re.I)
     if mline:
-        got = parse_date_from_text(mline[1][:160], today)
-        if got:
-            d, precise, matched = got
-            return d, precise, "description PURCHASE line ('%s')" % matched
+        det = parse_dates_detail(mline[1][:160], today)
+        if det:
+            # (d) COMPETING DATES EMIT AMBIGUOUS, NOT A NUMBER. Choosing the leftmost of two
+            # dates a year or more apart is a guess, and this module's output is "your claim
+            # may be time-barred" — a guess in either direction is a wrong answer that reads
+            # like a right one.
+            if det["ambiguous"]:
+                return None, False, ("AMBIGUOUS — the PURCHASE line names competing dates "
+                                     "(%s) and no one of them can be chosen without guessing "
+                                     "(%s). Capture MR Purchase Date from the receipt."
+                                     % (", ".join(x.isoformat() for x in det["candidates"]),
+                                        det["why"]))
+            g = _guard(det["date"], det["precise"],
+                       "description PURCHASE line ('%s')%s"
+                       % (det["matched"], " ~approx" if not det["precise"] else ""))
+            if g and g[0] is not None:
+                return g
+            if g:
+                rejected.append(g[2])
 
     # 3) 'bought/purchased ... N years ago' anywhere (client verbatim quotes, etc.)
     mrel = re.search(r"(?:bought|purchas\w*)[^.]{0,60}?"
@@ -299,8 +444,14 @@ def extract_case_date(issue, today=None):
         got = parse_date_from_text(mrel[1], today)
         if got:
             d, precise, matched = got
-            return d, precise, "description relative date ('%s')" % matched
+            g = _guard(d, precise, "description relative date ('%s')" % matched)
+            if g and g[0] is not None:
+                return g
+            if g:
+                rejected.append(g[2])
 
+    if rejected:
+        return None, False, "; ".join(rejected)
     return None, False, ""
 
 
@@ -357,7 +508,7 @@ def sol_status(purchase_or_incident_date, state, today=None):
         assumptions       : human-readable caveats
         verify            : always True — confirm live before relying on any date
     """
-    today = today or date.today()
+    today = today or businessday.today()
     code, _conf = (resolve_state(state) if isinstance(state, str) else (state, True))
     anchor = _to_date(purchase_or_incident_date)
     if anchor is None:
@@ -439,7 +590,7 @@ def scan(issues=None, today=None):
         {identifier, title, state, phase, has_date, date_source, date_precise,
          missing_reason?, sol? (the sol_status dict), surfaced (bool)}
     """
-    today = today or date.today()
+    today = today or businessday.today()
     if issues is None:
         import multica_api as mc  # deferred so the self-test needs no network
         issues = mc.list_issues()
@@ -461,9 +612,14 @@ def scan(issues=None, today=None):
         }
         anchor, precise, source = extract_case_date(it, today)
         if anchor is None:
+            # `source` now explains WHY there is no anchor when the parser refused one —
+            # AMBIGUOUS competing dates, or an anchor rejected for post-dating the case file.
+            # Reporting "date missing" for a case that actually has an impossible date on it
+            # would hide the thing a human has to fix.
             f.update({
                 "has_date": False,
-                "missing_reason": "SoL date missing — capture the purchase/incident date",
+                "missing_reason": (source or
+                                   "SoL date missing — capture the purchase/incident date"),
                 "surfaced": True,   # a missing SoL date is itself a thing to surface
             })
         else:
@@ -486,7 +642,7 @@ def render_scan_report(findings, today=None):
     Deliberately imperative-free per the workspace's hard-won rule #1 (a comment on a
     live-agent issue is read as an instruction). This states posture; it asks for nothing.
     """
-    today = today or date.today()
+    today = today or businessday.today()
     lines = ["=== M15 SoL watchdog - %s (RECORD ONLY, NO ACTION REQUIRED) ===" % today.isoformat()]
     lines.append("Every period below is a CONSERVATIVE estimate, verify=True. Not legal advice.\n")
 
@@ -562,7 +718,7 @@ def render_alert(findings, within_days=None, today=None):
     Deliberately imperative-free (workspace rule #1): it states posture, asks for nothing.
     """
     within = ALERT_WITHIN_DAYS if within_days is None else within_days
-    today = today or date.today()
+    today = today or businessday.today()
     hits = alerting(findings, within)
     if not hits:
         return ""
@@ -642,8 +798,14 @@ def _selftest():
     print("urgency bands OK")
 
     # --- date parsing (approx handling) ---
+    d, precise, m = parse_date_from_text("charges on May 11 2026.", T)
+    assert (d, precise) == (date(2026, 5, 11), True), "an UNhedged month-day-year is precise"
+    # CHANGED 2026-07-28 — this assertion used to demand precise=True for "~May 11 2026",
+    # which is the defect itself in test form: the tilde says the writer is estimating, and
+    # this module's output is "your claim may be time-barred". An estimate must never be
+    # reported as a known date.
     d, precise, m = parse_date_from_text("charges ~May 11 2026.", T)
-    assert (d, precise) == (date(2026, 5, 11), True), "month-day-year is precise"
+    assert (d, precise) == (date(2026, 5, 11), False), "a HEDGED date is never precise"
     d, precise, m = parse_date_from_text("purchased in 2023, warranty expired", T)
     assert d == date(2023, 1, 1) and precise is False, "bare year -> Jan 1, approx"
     d, precise, m = parse_date_from_text("failed after 3 yrs ago", T)
@@ -709,6 +871,89 @@ def _selftest():
     # ...while the full report still describes it, for the log
     assert "CASE-T3" in render_scan_report(healthy, today=T)
     print("\nM42 cron alert OK (alerts on trouble, silent when healthy)")
+
+    # =====================================================================================
+    # 2026-07-28 — THE WATCHDOG NO LONGER FABRICATES PRECISE DATES IN EITHER DIRECTION.
+    # Every input below is the REAL text off the live board.
+    # =====================================================================================
+    print("\n-- date-anchor guards (real board text) --")
+    sfails = []
+
+    def sok(label, cond, detail=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label,
+                               ("  [%s]" % detail) if detail else ""))
+        if not cond:
+            sfails.append(label)
+
+    # (a) HEDGES. "approximately May 15, 2024" is MER-75's real PURCHASE line.
+    d, precise, m = parse_date_from_text("approximately May 15, 2024", T)
+    sok("(a) 'approximately May 15, 2024' is NOT precise", d == date(2024, 5, 15) and not precise,
+        "%s precise=%s" % (d, precise))
+    for hedge in ("about 2 years ago or so", "circa 2024", "~2025-01", "roughly March 2024"):
+        got = parse_date_from_text(hedge, T)
+        sok("(a) hedged %r is never precise" % hedge, got and got[1] is False, str(got))
+
+    # (d) MER-3's REAL line. The old parser returned 2026-07-26 (the date King SPOKE) with
+    #     precise=True and reported 729 days of runway on a ~2024 Texas claim.
+    mer3_line = ('King (2026-07-26) says "about 2 years ago or so" (~2024), approximate by '
+                 'his own account; contradicts older "~2023" estimate')
+    det = parse_dates_detail(mer3_line, T)
+    sok("(d) MER-3's line is detected as AMBIGUOUS", det and det["ambiguous"], det and det["why"])
+    mer3 = {"identifier": "MER-3", "status": "in_review", "project_id": None,
+            "created_at": "2026-07-17T20:40:25Z",
+            "title": "Case: PPG Paints / Graco sprayer", "mr": {"MR Phase": "Tier2",
+                                                                "MR Jurisdiction": "TX"},
+            "description": "PURCHASE/DATES: " + mer3_line}
+    anchor, precise, source = extract_case_date(mer3, T)
+    sok("(d) MER-3 emits AMBIGUOUS instead of a fabricated date",
+        anchor is None and source.startswith("AMBIGUOUS"), source[:90])
+    f3 = scan(issues=[mer3], today=T)[0]
+    sok("(d) ...and the scan surfaces it as needing a real date, with the reason",
+        f3["has_date"] is False and f3["surfaced"] and "AMBIGUOUS" in f3["missing_reason"])
+    sok("(d) ...and NO all-clear day count is printed for it",
+        "729" not in render_scan_report(f3 and [f3], today=T))
+
+    # (b) AN ANCHOR CANNOT POST-DATE ITS OWN CASE FILE.
+    late = {"identifier": "MER-LATE", "status": "todo", "project_id": None,
+            "created_at": "2026-07-17T20:40:25Z", "title": "Case: Test",
+            "mr": {"MR Phase": "Tier1", "MR Purchase Date": "2026-07-26"},
+            "description": "PURCHASE/DATES: none given"}
+    anchor, precise, source = extract_case_date(late, T)
+    sok("(b) a purchase date AFTER created_at is rejected",
+        anchor is None and "post-dates the case file" in source, source[:90])
+    fine = dict(late, mr={"MR Phase": "Tier1", "MR Purchase Date": "2026-07-10"})
+    anchor, precise, source = extract_case_date(fine, T)
+    sok("(b) ...while a date BEFORE created_at is accepted normally",
+        anchor == date(2026, 7, 10) and precise is True, source)
+
+    # (c) MER-76's REAL placeholder properties: 2022-01-01 / 2023-01-01, written by hand today.
+    mer76 = {"identifier": "MER-76", "status": "in_review", "project_id": None,
+             "created_at": "2026-07-27T01:18:20Z", "title": "Case: Relax The Back",
+             "mr": {"MR Phase": "Tier1", "MR Jurisdiction": "Texas / Dallas County",
+                    "MR Purchase Date": "2022-01-01", "MR Discovery Date": "2023-01-01"},
+             "description": "PURCHASE/DATES (approximate OK): NOT PROVIDED -- STILL BLOCKING"}
+    anchor, precise, source = extract_case_date(mer76, T)
+    sok("(c) MER-76's Jan-1 property is flagged as a PROBABLE PLACEHOLDER",
+        anchor == date(2023, 1, 1) and precise is False and "PLACEHOLDER" in source,
+        source[:90])
+    corroborated = dict(mer76, description="Receipt shows the purchase on 2023-01-01 exactly.")
+    anchor, precise, source = extract_case_date(corroborated, T)
+    sok("(c) ...but a Jan-1 date CORROBORATED in the record is believed",
+        anchor == date(2023, 1, 1) and precise is True, source[:70])
+
+    # (6) TIMEZONE — the watchdog's own 'today' is the user's, not the UTC container's.
+    import ast as _ast
+    _tree = _ast.parse(open(os.path.abspath(__file__), encoding="utf-8").read())
+    _utc = [nd for nd in _ast.walk(_tree)
+            if isinstance(nd, _ast.Call) and isinstance(nd.func, _ast.Attribute)
+            and nd.func.attr == "today" and isinstance(nd.func.value, _ast.Name)
+            and nd.func.value.id == "date"]
+    sok("(6) sol_watchdog never uses the container's UTC date", not _utc,
+        "businessday.today() resolves the USER's day")
+
+    if sfails:
+        print("\nSELF-TEST FAILED — %d date guard(s) wrong: %s" % (len(sfails), ", ".join(sfails)))
+        raise AssertionError("sol_watchdog date-anchor guards failed: %s" % sfails)
 
     print("\nPASS - all sol_watchdog.py self-tests passed.")
 

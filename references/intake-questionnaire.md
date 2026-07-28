@@ -85,7 +85,7 @@ dispute.
 ## Section 7 — Discrimination check
 | # | Question | Priority | Why |
 |---|---|---|---|
-| 7.1 | **Do you believe you were treated differently or unfairly because of your race, color, religion, sex, national origin, age, disability, or another protected characteristic?** If yes — what specifically was said or done, by whom, and when? | 🔴 | Capture the **FACTS**, never manufacture a claim. A yes with supporting facts unlocks the civil-rights track (Tier 3-D): a separate statutory claim (e.g. CA Unruh, $4,000 statutory minimum), a civil-rights agency, and advocacy pressure — run in parallel, not after the consumer ladder |
+| 7.1 | **Do you believe you were treated differently or unfairly because of your race, color, religion, sex, national origin, age, disability, or another protected characteristic?** If yes — what specifically was said or done, by whom, and when? | 🔴 | Capture the **FACTS**, never manufacture a claim, and never suggest an answer. Rude, slow, or unhelpful service is not discrimination; being denied a return is not discrimination. A yes counts only when the user can name **a specific thing said or done tied to a protected characteristic**, or **a comparator** — someone outside their group treated differently in the same situation. Only then set `MR Discrimination Flag` and read the bar in `jurisdiction-lookup.md` §"Civil-rights track" — the filing is **sworn under penalty of perjury** and is 🔴 in its entirety. If the facts are not there, the consumer ladder runs unchanged and loses nothing |
 
 ---
 

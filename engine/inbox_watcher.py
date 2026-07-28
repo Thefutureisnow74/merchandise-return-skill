@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 # import the working send-path module purely for its self-refreshing access_token()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gmail_transport as g  # noqa: E402
+import heartbeat             # noqa: E402  (M46 — liveness ledger; writes a file, not the board)
 import mer_config            # noqa: E402  (M32 — identity comes from the profile, not a literal)
 import multica_api as mc     # noqa: E402  (M33 — the board is the case list)
 import case_queries          # noqa: E402  (M33 — one shared query resolver, no local table)
@@ -174,11 +175,17 @@ def _notify(items):
         urllib.request.urlopen(urllib.request.Request(
             "https://api.telegram.org/bot%s/sendMessage" % tok, data=payload,
             headers={"Content-Type": "application/json"}), timeout=20)
-    except Exception:
-        pass
+    except Exception as exc:
+        # M46: was `except Exception: pass`. An undelivered "new mail on a live case" ping is
+        # exactly as bad as no watcher at all, and it used to leave no trace anywhere.
+        print("inbox_watcher: telegram notify FAILED: %s" % exc)
+        heartbeat.log_error("mer-inbox-watcher", "notify failed: %s" % exc)
+        heartbeat.alert("⚠️ inbox_watcher could not deliver its new-mail notification: %s"
+                        % exc, key="inbox-watcher-notify-fail", cooldown=6 * 3600)
 
 
-def main():
+def main(note=None):
+    note = note or (lambda text: None)
     first_run = not os.path.exists(STATE_FILE)
     state = {}
     if not first_run:
@@ -195,9 +202,18 @@ def main():
         # Visible, never silent: these cases are open on the board but cannot be watched.
         print("inbox_watcher: %d open case(s) NOT watchable from board data:" % len(skipped))
         case_queries.log_skips(skipped)
+        # M46 — the COUNTER INVARIANT, asserted here too. `mer_engine` owns the 24h per-case
+        # timer (it holds the state file that can measure age); this watcher owns the
+        # every-run statement that the two counts must be equal. Two independent assertions
+        # of the same invariant, from two jobs on different clocks, so one job being wedged
+        # cannot make an unmonitored case invisible.
+        note("%d of %d tracked case(s) are not being watched for vendor mail: %s"
+             % (len(skipped), len(queries) + len(skipped),
+                ", ".join(cq.identifier for cq in skipped)))
 
     token = g.access_token()
     new_items = []
+    query_failures = []
 
     for ident, query in queries.items():
         case = labels.get(ident, ident)      # human label for the report/nag
@@ -207,6 +223,7 @@ def main():
             msgs = list_messages(query, token)
         except Exception as exc:
             print("query FAILED for %s: %s" % (case, exc))
+            query_failures.append("%s: %s" % (ident, exc))
             # keep whatever we knew before so we don't lose the baseline
             current_ids = list(prior)
             seen[ident] = current_ids
@@ -255,6 +272,25 @@ def main():
     else:
         print("inbox_watcher: %d new inbound message(s) across %d cases -> %s"
               % (len(new_items), len(queries), OUT_FILE))
+
+    # M46 — a run that could not read the mailbox is NOT a quiet week. This is the exact lie
+    # the engine has told four times: every query fails, nothing is reported, and the output
+    # is indistinguishable from "no vendor replied".
+    if query_failures:
+        allfail = len(query_failures) == len(queries) and queries
+        head = ("EVERY case query failed (%d/%d)" % (len(query_failures), len(queries))
+                if allfail else
+                "%d of %d case queries failed" % (len(query_failures), len(queries)))
+        print("inbox_watcher: !! " + head)
+        note(head)
+        heartbeat.alert("\U0001f6a8 inbox_watcher: %s — no vendor reply is being detected%s\n\n%s"
+                        % (head,
+                           ". This is the signature of an expired Gmail OAuth token."
+                           if allfail else "",
+                           "\n".join(query_failures[:8])),
+                        key="inbox-watcher-query-fail:%s" % ("all" if allfail else "partial"),
+                        cooldown=3 * 3600)
+    return 0
 
 
 # ------------------------------------------------------------------------------- selftest
@@ -321,7 +357,10 @@ def _selftest():
        "send_queue" in import_graph("mer_engine"), sorted(import_graph("mer_engine")))
     ck("import graph is small and known",
        graph <= {"gmail_transport", "mer_config", "multica_api", "case_queries",
-                 "businessday", "llm_providers"}, sorted(graph))
+                 "businessday", "llm_providers", "heartbeat", "king_nag"}, sorted(graph))
+    # heartbeat/king_nag are new (M46) and are the reason this allowlist grew. They may write
+    # a local ledger and push a Telegram message; they may NOT reach a mail-send or a board
+    # write, which is what the banned-import check above already proves for the whole graph.
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     body = src.split("def _selftest")[0]
     # Comments discuss the boundary; only code can cross it.
@@ -375,4 +414,6 @@ def _selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
-    main()
+    # M46 — every run writes {name, ts, ok, err}. A watcher that stops running, or runs and
+    # cannot read the mailbox, is now a detectable state instead of a silent one.
+    sys.exit(heartbeat.guard("mer-inbox-watcher", main, expect_seconds=21600.0))

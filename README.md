@@ -25,19 +25,30 @@ stop it.
 
 It never files in court, never spends your money, and never signs anything.
 
+## Your own purchases only
+
+Every letter goes out over **your** name and signature. The engine has no way to represent anyone
+else, and it will not try: a case marked as a client's or a third party's (`CLIENT:` in the title,
+or `CLIENT CASE` in the description) is **fenced out of the ladder entirely** and never advances.
+Helping a relative with their refund is out of scope for this tool.
+
 ## What it will send by itself
 
-This is the part to understand before you enable sending, and it is covered properly in
-[§4 of the user guide](USER-GUIDE.md).
+Three lanes. **The normative definition — including the test that decides which lane a novel action
+falls into — is `SKILL.md` §5, and that is the one to read.** In summary:
 
 | Lane | Behaviour |
 |---|---|
 | 🟢 **Green** | Always automatic — logging, watching, classifying, drafting, deadline maths. Nothing leaves. |
-| 🟡 **Yellow** | Sends **by itself** after a countdown (default 3 h): follow-up replies to a vendor you are *already* engaged with, and scheduled nudges. |
-| 🔴 **Red** | Never without your explicit yes: first contact with a **new** vendor, any regulatory filing, any court petition, spending money, signing, legal threats, closing a case. |
+| 🟡 **Yellow** | Sends **by itself** after a countdown (default 3 h) — but only to a vendor already writing to you on this case, in private email, asserting nothing new. |
+| 🔴 **Red** | Never without your explicit yes. Anything that reaches a new party, becomes a public or government record, moves money, forfeits a remedy, ends the case, or asserts a legal claim. **Anything ambiguous is Red.** |
 
-Sending is **off** until you turn it on (`MER_ENGINE_SEND=off|test|live`). In `test` every draft is
-redirected to you instead of the vendor, which is the honest way to watch it work before trusting it.
+Sending is **off** until you turn it on (`MER_ENGINE_SEND=off|test|live|veto`), and the shipped
+schedule sets `test`, in which every draft is redirected to **you** instead of the vendor. That means
+the Yellow lane does nothing at all until you edit that value in your own `schedule.json` and
+reinstall. Watch it work in `test` before trusting it.
+
+The user guide walks through the same ground for a non-programmer in §4.
 
 ## It will not talk you out of a claim
 
@@ -61,7 +72,7 @@ python engine/scheduler.py --install --live # give the engine a clock
 of it, and the failures that kill a return case are non-events: a vendor's silence, a limitations
 date, a letter that bounced after the mail server accepted it. Nothing inside the engine can
 trigger on those. `scheduler.py` detects whether your host uses cron, systemd timers or Windows
-Task Scheduler and installs six jobs; on a host with none of them, `scheduler.py --run-forever`
+Task Scheduler and installs nine jobs; on a host with none of them, `scheduler.py --run-forever`
 *is* the clock. `--dry-run` is the default, installing twice is safe, and it ships in `test` mode
 so your first week cannot reach a vendor. Details: [`references/scheduler.md`](references/scheduler.md).
 

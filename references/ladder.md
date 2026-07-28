@@ -19,10 +19,10 @@ Legend for the autonomy lane on each phase (full model in `SKILL.md` §5):
 | 2 | CASE FILE | — | 0 | Assign case_id; stamp jurisdiction/amount/vendor(s)/outcome; drop "(INTAKE INCOMPLETE)" | 🟢 | **all 🔴 intake fields answered** |
 | 3 | REMEDY MAP | **0** | 0 | Build case-specific lever list (regulator, statute, pre-suit rule, arbitration clause, civil-rights, class/defect check) | 🟢 | Phase 2 complete |
 | 4 | DISCOVERY | — | 0–1 | Find every vendor contact channel; **probe-verify no bounces**; identify seller AND manufacturer | 🟢 | Phase 3 complete |
-| 5 | TIER 1 SEND | **1** | 1 | Draft + send first vendor demand (seller + manufacturer in parallel); 7-business-day SLA | 🔴 (new vendor) | Phase 4 complete, ≥1 verified contact |
-| 6 | WAIT (Tier 1) | 1 | 1–7 | Daily SLA tick; **Day-3 follow-up nudge**; on reply → CLASSIFY | 🟡 (nudge) | Phase 5 sent |
-| 7 | RETENTION ASK | 1 | 3–7 | "Transfer me to retention/refund authority" | 🟡 | Phase 6 elapsed to day ≥3 **or** a reply |
-| 8 | TIER 2 | **2** | 7 | Exec + counsel letters **+ public/media + elected-official casework**; new tighter SLA | 🔴 (new channel) | Phase 7 cleared (no resolution) **and** day ≥7 |
+| 5 | TIER 1 SEND | **1** | 1 | Draft + send first vendor demand (seller + manufacturer in parallel); **5-business-day SLA** | 🔴 (new vendor) | Phase 4 complete, ≥1 verified contact |
+| 6 | WAIT (Tier 1) | 1 | 1–5 | Daily SLA tick; **Day-3 follow-up nudge**; on reply → CLASSIFY | 🟡 (nudge) | Phase 5 sent |
+| 7 | RETENTION ASK | 1 | 3–5 | "Transfer me to retention/refund authority" | 🟡 if by email to the engaged vendor; 🔴 if the engine places a call | Phase 6 elapsed to day ≥3 **or** a reply |
+| 8 | TIER 2 | **2** | 5 | Exec + counsel letters; public/media + elected-official casework only on a separate 🔴 YES each | 🔴 (new channel, public record) | Phase 7 cleared (no resolution) **and** day ≥5 |
 | 9 | WAIT (Tier 2) | 2 | 7–14 | Daily SLA tick; on reply → CLASSIFY | 🟡 (nudge) | Phase 8 sent |
 | 10 | TIER 3 REGULATORY | **3** | 14 | The **researched** regulators in parallel: industry (FCC/CFPB/…) + state consumer agency + AG + BBB + FTC | 🔴 (filing) | **Phase 9 marked cleared** (no resolution) **and** day ≥14 |
 | — | CIVIL-RIGHTS TRACK | **3-D** | on flag | State civil-rights agency + statutory claim + advocacy org — **parallel, does not wait** | 🔴 (filing) | discrimination flagged in Phase 1 **and** facts support |
@@ -40,9 +40,11 @@ channel / filing / legal threat).
 
 ## Day windows (the current standard)
 
-- **Tier 1 window = 5 business days, with a Day-3 follow-up nudge.** Count **business** days, then
-  sanity-check the calendar end date before sending. ("7 business days from a Friday" ≠ "+7 calendar
-  days" — this is a documented, repeated error.)
+- **Tier 1 window = 5 business days, with a Day-3 follow-up nudge.** This is the single value used
+  everywhere — `case_tick.PHASE_SLA["Tier1"] = 5`, every letter template, and SKILL.md §3. **Never
+  write 7.** Count **business** days with `engine/businessday.py`, then sanity-check the calendar end
+  date before sending ("5 business days from a Friday" ≠ "+5 calendar days" — a documented, repeated
+  error).
 - Downstream tiers open on the **prior phase being marked cleared AND** the day threshold — both, not
   either. A gate is never opened by the calendar alone.
 - These windows are defaults; a specific vendor letter may state its own SLA, in which case honor the
@@ -52,7 +54,7 @@ channel / filing / legal threat).
 
 ## Phase 3 / Tier 0 — who actually writes the remedy map (added 2026-07-26)
 
-`scripts/vps/remedy_map.py` **is** phase 3. `case_tick.py` calls it in `--live` for any case
+`engine/remedy_map.py` **is** phase 3. `case_tick.py` calls it in `--live` for any case
 sitting at `RemedyMap` with an empty `MR Remedy Map`, writes the lever list to that property via
 `multica_api.set_properties`, and logs a `RECORD ONLY - NO ACTION REQUIRED` comment (routed to the
 activity issue when the case has a live agent). Tier 0 **sends nothing** — it is research and
@@ -94,8 +96,17 @@ duplicating and never dropping an existing entry.
 4. **Chargeback is parallel, not sequential** — it runs from the card issuer's portal on its own
    ~120-day clock, independent of the court petition. If the purchase is older than the window, the
    chargeback path is dead; do not build strategy on it (see `court-and-chargeback.md`).
-5. The **civil-rights track (3-D)** is the one branch that runs in parallel from the moment it's
-   flagged — discrimination does not wait for the consumer ladder to fail.
+5. The **civil-rights track (3-D)** is the one branch that is not blocked by Tier 2 failing — but
+   "parallel" does not mean "automatic". 3-D is **🔴 in its entirety**: the bar in
+   `jurisdiction-lookup.md` §"Civil-rights track" must be met on named facts, and the user must give
+   a per-item YES for each filing, because the complaint is **sworn under penalty of perjury**.
+   Nothing on this track is ever queued on a veto window.
+6. **CLIENT / third-party cases never auto-advance — GATE 0.** `case_tick` refuses to advance any
+   case whose **title starts `CLIENT:`**, whose **description contains `CLIENT CASE`** in its opening
+   block, or that carries an affirmative client-case property. Entering a tier is what queues contact
+   with a third party, and that needs written authorization this skill does not collect. Such a case
+   sits at its phase indefinitely, by design. **This skill is for the user's own purchases only** —
+   if a case is stalled for this reason, say so; it is not a bug to debug.
 
 ---
 

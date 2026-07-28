@@ -22,13 +22,15 @@ The SEND path is deliberately off by default: this is the one irreversible step.
 config change (MER_ENGINE_SEND=veto) once the loop is proven — not a code change.
 """
 import base64
+import email.utils
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/data/scripts")
+import heartbeat                           # noqa: E402  (M46 — liveness ledger + alarm bell)
 import gmail_transport                     # noqa: E402  send path (gated)
 import gmail_fetch                         # noqa: E402
 import pdf_text                            # noqa: E402
@@ -47,6 +49,28 @@ SEND_MODE = os.environ.get("MER_ENGINE_SEND", "off").lower()   # off | test | ve
 WINDOW_H = int(os.environ.get("MER_ENGINE_WINDOW_HOURS", "3"))
 LOOKBACK = "newer_than:14d"
 MAX_PER_CASE = 8
+
+# M46 — how many message ids to remember PER CASE. `seen` used to be REPLACED every run with
+# the <=8 ids the current `newer_than:14d` query returned, so an id that fell out of the
+# window was forgotten and, if the thread later surfaced it again, was reprocessed: a second
+# classification comment on the board and, in the send lanes, a second drafted reply to the
+# vendor. It is now a bounded UNION — freshest first, capped — so a busy thread cannot push
+# an already-handled message back into "new", and the file still cannot grow without limit.
+SEEN_MAX = 250
+
+# M46 — the board property that records that a vendor actually answered. Nothing wrote this,
+# which meant the escalation hold gate was blind: MER-76's vendor replied 2026-07-27 and the
+# board recorded nothing, so the case would have auto-escalated over a live conversation.
+# The property is a DATE. Autoresponders and delivery receipts must never set it; a brush-off
+# ("we've escalated internally") is a real reply and DOES set it — deciding whether that
+# holds the gate is the READING side's job, not this one's.
+VENDOR_REPLY_PROP = os.environ.get("MER_VENDOR_REPLY_PROPERTY", "MR Last Vendor Reply")
+
+# M46 — how long a tracked case may sit with no monitoring query before it becomes an ALARM
+# rather than a log line. Three of six live cases were silently unmonitored for days because
+# no vendor address was on the record; case_queries computed a perfectly good reason string
+# and the engine printed it into a log nobody reads.
+SKIP_ALARM_SECONDS = float(os.environ.get("MER_SKIP_ALARM_SECONDS", 24 * 3600))
 
 # M33 — case discovery. The hand-maintained identifier->query table that used to live here (and
 # again, verbatim, in inbox_watcher.py) is DELETED. Every case's Gmail query is derived at runtime
@@ -169,18 +193,198 @@ def attachment_text(mid, token):
     return "\n".join(txt)
 
 
-def load_state():
+class StateCorrupt(RuntimeError):
+    """The state file exists but cannot be trusted.
+
+    THE BUG THIS TYPE EXISTS TO KILL (M46): load_state() returned {"seen": {}} on ANY error,
+    while `first_run` was computed separately from whether the file EXISTED. So a corrupt
+    state file produced first_run=False (the file is there) with an empty seen-set — and
+    first_run=False is precisely the flag that says "act on everything you find". Every
+    message in the 14-day window on every case would have been reprocessed, re-commented,
+    and in the send lanes re-drafted to every vendor at once.
+
+    Absent is fine and means "establish a baseline". Corrupt is a refusal.
+    """
+
+
+def load_state(path=None):
+    """-> (state, status) where status is 'absent' (fine) or 'ok'. Raises on corrupt."""
+    path = path or STATE
+    if not os.path.exists(path):
+        return {"seen": {}}, "absent"
     try:
-        return json.load(open(STATE))
-    except Exception:
-        return {"seen": {}}
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        raise StateCorrupt("%s is unreadable (%s)" % (path, exc))
+    if not isinstance(data, dict) or not isinstance(data.get("seen", {}), dict):
+        raise StateCorrupt("%s is not the expected shape (want {'seen': {case: [ids]}})" % path)
+    data.setdefault("seen", {})
+    return data, "ok"
 
 
-def main():
+def merge_seen(prior, current, cap=SEEN_MAX):
+    """Bounded union: everything in `current`, then anything from `prior` not already there.
+
+    Order matters — freshest first — because the cap truncates the TAIL, and the ids most
+    likely to reappear in the next 14-day window are the newest ones.
+    """
+    out = []
+    for mid in list(current) + list(prior or []):
+        if mid not in out:
+            out.append(mid)
+    return out[:cap]
+
+
+# --------------------------------------------------- is this a REAL reply from a human?
+
+# Headers a well-behaved autoresponder or a mail system sets on itself. RFC 3834's
+# Auto-Submitted is the standards-track one; the X-* headers are what the field actually
+# uses. Any of these means "no human composed this".
+_AUTO_HEADERS = {
+    "auto-submitted": lambda v: v.strip().lower() != "no",
+    "x-autoreply": lambda v: True,
+    "x-autorespond": lambda v: True,
+    "x-auto-response-suppress": lambda v: True,
+    "precedence": lambda v: v.strip().lower() in ("auto_reply", "bulk", "list", "junk"),
+}
+
+# Local-parts that never belong to a person who is answering you.
+_ROBOT_LOCALPARTS = ("noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
+                     "do_not_reply", "mailer-daemon", "postmaster", "bounce", "bounces")
+
+# Subject shapes that are a machine talking, not a vendor answering. Kept SHORT and specific:
+# every entry here is a way to LOSE a real reply, so the bar for adding one is high.
+_AUTO_SUBJECTS = (
+    "out of office", "out-of-office", "automatic reply", "auto-reply", "autoreply",
+    "auto: ", "delivery status notification", "undeliverable", "undelivered mail",
+    "returned mail", "mail delivery failed", "mail delivery subsystem",
+    "read receipt", "read: ", "delivery receipt", "message delivery notification",
+)
+
+
+def is_autoresponder(hdr, body="", content_type=""):
+    """(True, why) if this inbound was generated by a machine rather than composed by a person.
+
+    Deliberately asymmetric to the client-case test above it: a FALSE POSITIVE here throws
+    away the evidence that a vendor replied, which is exactly the signal the escalation hold
+    gate needs. So this only fires on unambiguous machine markers — headers, robot senders,
+    and bounce/out-of-office subjects — and never on the CONTENT of a reply. A brush-off is
+    a reply.
+    """
+    low = {str(k).lower(): str(v) for k, v in (hdr or {}).items()}
+    for name, test in _AUTO_HEADERS.items():
+        v = low.get(name)
+        if v is not None and test(v):
+            return True, "%s: %s" % (name, v.strip()[:40])
+    frm = low.get("from", "").lower()
+    for lp in _ROBOT_LOCALPARTS:
+        if lp + "@" in frm:
+            return True, "sender is a no-reply/daemon address"
+    subj = low.get("subject", "").lower()
+    for pat in _AUTO_SUBJECTS:
+        if pat in subj:
+            return True, "subject looks automated (%r)" % pat
+    ct = (content_type or low.get("content-type") or "").lower()
+    if "report-type=delivery-status" in ct or "message/delivery-status" in ct:
+        return True, "delivery status report (DSN)"
+    if low.get("x-failed-recipients"):
+        return True, "bounce (X-Failed-Recipients)"
+    return False, ""
+
+
+def reply_date(hdr, now=None):
+    """The date to stamp on the case, as YYYY-MM-DD, from the message's own Date header.
+
+    Falls back to today (UTC) rather than to nothing: a reply whose Date header is missing or
+    unparseable still happened, and 'we know a vendor replied but not when' is a worse state
+    for the hold gate than 'today'.
+    """
+    raw = (hdr or {}).get("Date") or (hdr or {}).get("date")
+    if raw:
+        try:
+            dt = email.utils.parsedate_to_datetime(raw)
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc).date().isoformat()
+        except Exception:
+            pass
+    return (now or datetime.now(timezone.utc)).date().isoformat()
+
+
+def _alert(text, key, cooldown=None):
+    kw = {"key": key}
+    if cooldown is not None:
+        kw["cooldown"] = cooldown
+    try:
+        return heartbeat.alert(text, **kw)
+    except Exception as exc:                    # the alarm bell must never be the crash
+        print("  (ALERT FAILED: %s) %s" % (exc, text[:200]))
+        return False, str(exc)
+
+
+def check_skips(st, unwatchable, tracked, monitored, now=None, alerter=None):
+    """The alarm for defect 5. Returns a list of human-readable problems (also alerted).
+
+    Two independent checks, because they fail differently:
+      * a per-case timer — a case that has produced no monitoring query for over 24h is a
+        case nobody is watching, and it names the case AND the missing field;
+      * a COUNTER INVARIANT — tracked == monitored, asserted every single tick. The timer
+        can be defeated by a case that is skipped, fixed, and skipped again; the invariant
+        cannot, because it is a statement about right now.
+    """
+    now = now or datetime.now(timezone.utc)
+    alerter = alerter or _alert
+    problems = []
+    skips = st.setdefault("skips", {})
+    still = set()
+
+    for cq in unwatchable:
+        ident = getattr(cq, "identifier", None) or str(cq)
+        reason = getattr(cq, "reason", "") or "no reason recorded"
+        still.add(ident)
+        rec = skips.get(ident)
+        if not isinstance(rec, dict) or not rec.get("first_seen"):
+            rec = {"first_seen": now.isoformat(), "reason": reason, "alerted": False}
+            skips[ident] = rec
+        rec["reason"] = reason
+        rec["last_seen"] = now.isoformat()
+        try:
+            first = datetime.fromisoformat(str(rec["first_seen"]).replace("Z", "+00:00"))
+        except Exception:
+            first = now
+            rec["first_seen"] = now.isoformat()
+        age = (now - first).total_seconds()
+        if age >= SKIP_ALARM_SECONDS:
+            msg = ("%s has produced NO monitoring query for %.0f hours. Nothing is watching "
+                   "for a vendor reply on that case. Missing on the record: %s"
+                   % (ident, age / 3600.0, reason))
+            problems.append(msg)
+            alerter("\U0001f6a8 Unmonitored case\n" + msg +
+                    "\nFix: add the vendor's email address or domain to the case record on "
+                    "the board, then this clears itself on the next tick.",
+                    "unmonitored:%s" % ident, 12 * 3600)
+
+    for ident in [k for k in skips if k not in still]:
+        skips.pop(ident, None)                 # fixed — stop counting, stop alerting
+
+    if monitored != tracked:
+        msg = ("COUNTER INVARIANT BROKEN: %d case(s) tracked, %d monitored — %d case(s) are "
+               "open on the board with nothing watching their mail: %s"
+               % (tracked, monitored, tracked - monitored,
+                  ", ".join(sorted(still)) or "(unnamed)"))
+        problems.append(msg)
+        alerter("⚠️ merchandise-return: " + msg, "invariant:tracked-vs-monitored", 6 * 3600)
+    return problems
+
+
+def main(note=None):
+    note = note or (lambda text: None)
     commit = "--commit" in sys.argv
     notify = "--notify" in sys.argv
-    first_run = not os.path.exists(STATE)
-    st = load_state()
+    st, status = load_state()
+    first_run = status == "absent"
     seen = st.get("seen", {})
 
     try:
@@ -204,13 +408,22 @@ def main():
     # fallback query, because an over-broad query pulls unrelated mail into a case and gets it
     # classified (and, in the send lanes, replied to) as if it belonged there.
     queries, unwatchable = case_queries.resolve_all(issues.values())
-    print("discovery: %d case(s) watchable from the board, %d skipped."
-          % (len(queries), len(unwatchable)))
+    tracked = len(queries) + len(unwatchable)
+    print("discovery: %d case(s) tracked, %d monitored, %d skipped."
+          % (tracked, len(queries), len(unwatchable)))
     if unwatchable:
         case_queries.log_skips(unwatchable)
+    # M46 — a skipped case is no longer only a log line. Over 24h it is an ALARM naming the
+    # case and the missing field, and tracked != monitored is an alarm every single tick.
+    for problem in check_skips(st, unwatchable, tracked, len(queries)):
+        print("  !! %s" % problem)
+        note(problem)
 
     tg_high = []
     tg_client = []
+    query_failures = []
+    board_write_failures = []
+    vendor_replies = {}          # ident -> the latest substantive reply date seen this run
     for ident, query in queries.items():
         issue = issues.get(ident)
         if not issue or (issue.get("status") in ("done", "cancelled")):
@@ -226,7 +439,13 @@ def main():
             req = urllib.request.Request(url, headers={"Authorization": "Bearer %s" % token})
             msgs = json.loads(urllib.request.urlopen(req, timeout=25).read()).get("messages", []) or []
         except Exception as e:
-            print("  %s query failed: %s" % (ident, e)); continue
+            # A per-case query failure used to be print + continue, which is how a dead Gmail
+            # token turned into a run that finished and printed "done. 0 HIGH item(s)". It is
+            # now a recorded failure: the run cannot report itself green (see the guard in
+            # __main__), and `seen` for this case is deliberately left untouched below.
+            print("  %s query failed: %s" % (ident, e))
+            query_failures.append("%s: %s" % (ident, e))
+            continue
 
         for m in msgs:
             mid = m["id"]
@@ -242,6 +461,7 @@ def main():
             # M32/M33: the self-address filter is identity, so it comes from the profile.
             if _self_email and _self_email in frm.lower():
                 continue  # our own sent copy
+            auto, auto_why = is_autoresponder(hdr)
             body = body_text(full)
             atext = attachment_text(mid, token)
             cls = classify_llm.classify(body, atext)
@@ -257,9 +477,21 @@ def main():
             if atext:
                 print("     (read %d chars of PDF attachment)" % len(atext))
 
-            note = ("RECORD ONLY - NO ACTION REQUIRED [re %s]. Inbound classified: %s (%s). "
-                    "Resolved=%s: %s. Subject: %s" %
-                    (ident, cat, lane, res.get("resolved"), res.get("reason", "")[:120], subj))
+            # ---- M46: RECORD THAT A VENDOR ACTUALLY REPLIED --------------------------------
+            # The one thing the escalation hold gate needs and nothing was writing. A machine
+            # -generated message (out-of-office, DSN, read receipt, no-reply sender) is NOT a
+            # reply and must not hold the gate; a brush-off is, and does.
+            if auto:
+                print("     (autoresponder — %s; NOT recorded as a vendor reply)" % auto_why)
+            elif not is_client_case(ident, issue):
+                d = reply_date(hdr)
+                if d > vendor_replies.get(ident, ""):
+                    vendor_replies[ident] = d
+
+            board_note = ("RECORD ONLY - NO ACTION REQUIRED [re %s]. Inbound classified: %s (%s). "
+                          "Resolved=%s: %s. Subject: %s" %
+                          (ident, cat, lane, res.get("resolved"),
+                           res.get("reason", "")[:120], subj))
             if commit:
                 # Wake-agent safe: a comment on an issue with a LIVE AGENT assigned wakes that
                 # agent and is read as an instruction (the 2026-07-18 bank-double-email lesson), so
@@ -269,9 +501,13 @@ def main():
                 target = activity_log if (issue.get("assignee_type") == "agent" and activity_log) \
                     else issue["id"]
                 try:
-                    mc.add_comment(target, note)
+                    mc.add_comment(target, board_note)
                 except Exception as e:
+                    # Was a bare print. A board that is not accepting writes means the case
+                    # record is drifting away from what actually happened, silently — the
+                    # MER-76 failure mode exactly.
                     print("     (board write failed: %s)" % e)
+                    board_write_failures.append("%s comment: %s" % (ident, e))
             if cat in HIGH:
                 tg_high.append("%s: %s — %s" % (ident, cat, subj))
 
@@ -313,7 +549,41 @@ def main():
                 elif lane == "RED":
                     print("     -> RED (%s): needs your review — surfaced, NOT auto-sent" % cat)
 
-        seen[ident] = current
+        # M46: bounded UNION, not replacement. See SEEN_MAX.
+        seen[ident] = merge_seen(seen.get(ident, []), current)
+
+    # ---- M46: write "MR Last Vendor Reply" ------------------------------------------------
+    # One write per case per run, after the loop, so a thread with four new messages produces
+    # one board write carrying the newest date rather than four.
+    if commit and vendor_replies:
+        for ident, when in sorted(vendor_replies.items()):
+            issue = issues.get(ident)
+            if not issue:
+                continue
+            existing = str((issue.get("mr") or {}).get(VENDOR_REPLY_PROP) or "")[:10]
+            if existing and existing >= when:
+                print("  %s vendor reply %s already recorded (board has %s)"
+                      % (ident, when, existing))
+                continue
+            try:
+                mc.set_properties(issue, {VENDOR_REPLY_PROP: when})
+                print("  %s -> %s = %s" % (ident, VENDOR_REPLY_PROP, when))
+            except ValueError as e:
+                # The board has no such property. Not fatal — but it means the hold gate is
+                # blind on this board, so say so once rather than every run forever.
+                print("  (%s not written: %s)" % (VENDOR_REPLY_PROP, e))
+                _alert("⚠️ merchandise-return: cannot record vendor replies.\n%s\n"
+                       "Add a DATE property named %r to the workspace, or set "
+                       "MER_VENDOR_REPLY_PROPERTY to the name you use. Until then the "
+                       "escalation hold gate cannot see that a vendor answered."
+                       % (e, VENDOR_REPLY_PROP), "vendor-reply-prop-missing", 24 * 3600)
+            except Exception as e:
+                print("  (%s write failed for %s: %s)" % (VENDOR_REPLY_PROP, ident, e))
+                board_write_failures.append("%s %s: %s" % (ident, VENDOR_REPLY_PROP, e))
+    elif vendor_replies:
+        print("  (dry-run) would record %s on: %s"
+              % (VENDOR_REPLY_PROP,
+                 ", ".join("%s=%s" % kv for kv in sorted(vendor_replies.items()))))
 
     if notify and not first_run:
         if tg_high:
@@ -326,41 +596,230 @@ def main():
 
     st["seen"] = seen
     if commit or first_run:
-        json.dump(st, open(STATE, "w"), indent=2)
-    print("done. %d HIGH item(s), %d client item(s)%s."
-          % (len(tg_high), len(tg_client), "" if commit else " (dry-run — no writes)"))
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(st, fh, indent=2)
+        os.replace(tmp, STATE)      # atomic: a crash mid-write is what produces a corrupt file
+
+    # ---- M46: the run cannot report itself green if anything actually failed ---------------
+    if query_failures:
+        total = len(queries)
+        allfail = total and len(query_failures) == total
+        head = ("EVERY per-case mailbox query failed (%d/%d). No vendor reply is being seen "
+                "on ANY case." % (len(query_failures), total)) if allfail else \
+               ("%d of %d per-case mailbox queries failed." % (len(query_failures), total))
+        note(head)
+        print("!! " + head)
+        auth = any(("401" in f or "403" in f or "invalid_grant" in f.lower()
+                    or "unauthorized" in f.lower()) for f in query_failures)
+        _alert("\U0001f6a8 merchandise-return engine: %s%s\n\n%s"
+               % (head,
+                  "\nThis is the signature of an EXPIRED GMAIL OAUTH TOKEN — re-authorise the "
+                  "mailbox." if (auth or allfail) else "",
+                  "\n".join(query_failures[:8])),
+               "gmail-query-fail:%s" % ("all" if allfail else "partial"), 3 * 3600)
+    if board_write_failures:
+        note("%d board write(s) failed" % len(board_write_failures))
+        _alert("\U0001f6a8 merchandise-return engine: %d board write(s) FAILED. The case "
+               "records no longer match what actually happened.\n\n%s"
+               % (len(board_write_failures), "\n".join(board_write_failures[:8])),
+               "board-write-fail", 3 * 3600)
+
+    print("done. %d HIGH item(s), %d client item(s), %d vendor reply date(s)%s."
+          % (len(tg_high), len(tg_client), len(vendor_replies),
+             "" if commit else " (dry-run — no writes)"))
+    return 0
 
 
 def _telegram(text):
-    env = {}
+    """Operator-facing notification.
+
+    Was: build the message, try to POST it, `except Exception: pass`. A failed alert was
+    therefore indistinguishable from a delivered one — the alarm bell could be broken and the
+    engine would never know. It now goes through heartbeat.alert(), which falls back to a
+    second transport, prints the failure, writes it to the unbounded error log, and records a
+    failed beat for `heartbeat-alert` so `heartbeat.py --check` reports "the alerter itself
+    is down" on its next pass.
+
+    force=True: these are per-item case notifications, not repeated health warnings, so they
+    must never be swallowed by the de-duplication cooldown.
+    """
+    sent, why = heartbeat.alert(text, key="mer-engine-notify", force=True)
+    if not sent:
+        print("  (telegram NOT delivered: %s)" % why)
+    return sent
+
+
+# ------------------------------------------------------------------------------- selftest
+
+def _selftest():
+    """Offline. No mailbox, no board, no LLM, no send — the pure decision functions only."""
+    import shutil
+    import tempfile
+
+    fails = []
+
+    def ck(name, cond, detail=""):
+        print("  [%s] %s%s" % ("PASS" if cond else "FAIL", name,
+                               "" if cond else "  <- " + str(detail)))
+        if not cond:
+            fails.append(name)
+
+    tmp = tempfile.mkdtemp(prefix="mer_engine_selftest_")
+    print("mer_engine --selftest  (offline)")
+    print("-" * 70)
+
+    print("A. seen-state is a BOUNDED UNION, not a replacement (M46 / defect 7)")
+    ck("ids that fell out of the query window are still remembered",
+       merge_seen(["old1", "old2"], ["new1"]) == ["new1", "old1", "old2"],
+       merge_seen(["old1", "old2"], ["new1"]))
+    ck("no duplicates", merge_seen(["a", "b"], ["b", "c"]) == ["b", "c", "a"],
+       merge_seen(["a", "b"], ["b", "c"]))
+    big = merge_seen([str(i) for i in range(1000)], ["x"], cap=5)
+    ck("the union is capped so the file cannot grow forever", len(big) == 5, big)
+    ck("the cap keeps the FRESHEST ids", big[0] == "x", big)
+    ck("an id already seen never becomes new again",
+       "b" in merge_seen(merge_seen([], ["a", "b"]), ["c"]))
+
+    print("B. absent state vs CORRUPT state (M46 / defect 7)")
+    p = os.path.join(tmp, "state.json")
+    stt, status = load_state(p)
+    ck("an absent state file is 'absent' and gives an empty seen-set",
+       status == "absent" and stt == {"seen": {}}, (status, stt))
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"seen": {"MER-X": ["m1"]}}, fh)
+    stt, status = load_state(p)
+    ck("a good state file loads", status == "ok" and stt["seen"]["MER-X"] == ["m1"], stt)
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("{ this is not json")
+    raised = False
     try:
-        for line in open("/opt/data/.env"):
-            s = line.strip()
-            if s and not s.startswith("#") and "=" in s:
-                k, v = s.split("=", 1); env[k.strip()] = v.strip().strip('"').strip("'")
-    except Exception:
-        pass                      # no shared .env (a non-VPS install) — fall back to the environment
-    # M32: WHO gets notified is profile data; the bot TOKEN stays a secret in the environment and
-    # never enters a profile. Same precedence as inbox_watcher and king_nag — those two already
-    # read the profile here and this one did not, so a new user's HIGH-priority case alerts would
-    # have gone to King's chat id or nowhere at all.
+        load_state(p)
+    except StateCorrupt:
+        raised = True
+    ck("a CORRUPT state file raises instead of silently yielding an empty seen-set", raised)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"seen": ["not", "a", "dict"]}, fh)
+    raised = False
     try:
-        uid = mer_config.notify_telegram_chat_id()
-    except Exception:
-        uid = None
-    uid = uid or env.get("TELEGRAM_USER_ID") or os.environ.get("TELEGRAM_USER_ID")
-    tok = env.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not (tok and uid):
-        return
-    import urllib.request
+        load_state(p)
+    except StateCorrupt:
+        raised = True
+    ck("a wrong-shaped state file also raises", raised)
+
+    print("C. autoresponders and receipts are not vendor replies (M46 / defect 3)")
+    for hdr, why in (
+            ({"From": "svc@vendor.com", "Subject": "Automatic reply: your case"}, "OOO subject"),
+            ({"From": "svc@vendor.com", "Subject": "Out of Office"}, "out of office"),
+            ({"From": "noreply@vendor.com", "Subject": "Ticket 55 updated"}, "no-reply sender"),
+            ({"From": "MAILER-DAEMON@vendor.com", "Subject": "hi"}, "daemon"),
+            ({"From": "a@v.com", "Subject": "hi", "Auto-Submitted": "auto-replied"}, "RFC 3834"),
+            ({"From": "a@v.com", "Subject": "hi", "Precedence": "bulk"}, "bulk"),
+            ({"From": "a@v.com", "Subject": "Delivery Status Notification (Failure)"}, "DSN"),
+            ({"From": "a@v.com", "Subject": "Read: our demand letter"}, "read receipt"),
+            ({"From": "a@v.com", "Subject": "hi", "X-Failed-Recipients": "x@y.com"}, "bounce")):
+        ck("machine mail is rejected (%s)" % why, is_autoresponder(hdr)[0] is True, hdr)
+    for hdr, why in (
+            ({"From": "Jane <jane@vendor.com>", "Subject": "Re: your refund request"}, "real"),
+            ({"From": "esc@vendor.com", "Subject": "Re: refund"}, "brush-off"),
+            ({"From": "a@v.com", "Subject": "hi", "Auto-Submitted": "no"}, "explicit no")):
+        ck("a human reply is NOT rejected (%s)" % why, is_autoresponder(hdr)[0] is False, hdr)
+    ck("a brush-off body is still a reply",
+       is_autoresponder({"From": "e@v.com", "Subject": "Re: refund"},
+                        "We have escalated this internally.")[0] is False)
+
+    print("D. the reply date comes from the message, not from the clock")
+    ck("a Date header is used",
+       reply_date({"Date": "Mon, 27 Jul 2026 14:03:11 -0500"}) == "2026-07-27",
+       reply_date({"Date": "Mon, 27 Jul 2026 14:03:11 -0500"}))
+    ck("a missing Date falls back to today, never to nothing",
+       reply_date({}, now=datetime(2026, 7, 28, tzinfo=timezone.utc)) == "2026-07-28")
+    ck("an unparseable Date falls back to today",
+       reply_date({"Date": "yesterday-ish"},
+                  now=datetime(2026, 7, 28, tzinfo=timezone.utc)) == "2026-07-28")
+
+    print("E. an unmonitored case is an ALARM, not a log line (M46 / defect 5)")
+
+    class FakeCQ(object):
+        def __init__(self, ident, reason):
+            self.identifier, self.reason = ident, reason
+
+    alerts = []
+
+    def cap(text, key, cooldown=None):
+        alerts.append(key)
+        return True, "captured"
+
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    st = {}
+    skipped = [FakeCQ("MER-A", "no vendor address or domain on the record")]
+    probs = check_skips(st, skipped, tracked=3, monitored=2, now=now, alerter=cap)
+    ck("a brand-new skip does not alarm yet (it may be minutes old)",
+       not any(k.startswith("unmonitored:") for k in alerts), alerts)
+    ck("but the COUNTER INVARIANT alarms immediately",
+       "invariant:tracked-vs-monitored" in alerts and len(probs) == 1, (alerts, probs))
+    del alerts[:]
+    later = now + timedelta(hours=25)
+    probs = check_skips(st, skipped, tracked=3, monitored=2, now=later, alerter=cap)
+    ck("after 24h the case itself alarms, by name",
+       "unmonitored:MER-A" in alerts, alerts)
+    ck("the alarm names the missing field",
+       any("no vendor address or domain" in p for p in probs), probs)
+    del alerts[:]
+    probs = check_skips(st, [], tracked=3, monitored=3, now=later, alerter=cap)
+    ck("a fixed case stops alarming and is forgotten",
+       not alerts and not probs and st.get("skips") == {}, (alerts, probs, st))
+    st2 = {}
+    ck("tracked == monitored with zero skips is silent",
+       check_skips(st2, [], tracked=0, monitored=0, now=now, alerter=cap) == [])
+
+    print("F. structural — the notifier can no longer fail silently")
+    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    body = src.split("def _selftest")[0]
+    tg = body.split("def _telegram")[1].split("\ndef ")[0]
+    # Its docstring QUOTES the old `except Exception: pass` to explain what was wrong, so the
+    # check must look at code, not prose — a comment describing a bug is not the bug.
+    tg_code = tg.split('"""')[-1]
+    ck("_telegram no longer swallows its own failure",
+       "except Exception" not in tg_code, tg_code)
+    ck("_telegram routes through the heartbeat alerter", "heartbeat.alert" in tg)
+    ck("_telegram reports an undelivered alert to its caller", "not sent" in tg)
+    ck("the entry point is wrapped in a heartbeat guard", "heartbeat.guard(" in src)
+    ck("state is written atomically", "os.replace(tmp, STATE)" in body)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("-" * 70)
+    if fails:
+        print("SELF-TEST FAILED: %s" % ", ".join(fails))
+        return 1
+    print("PASS — mer_engine self-test green (offline; no mailbox, no board, no send).")
+    return 0
+
+
+def _run(note):
     try:
-        urllib.request.urlopen(urllib.request.Request(
-            "https://api.telegram.org/bot%s/sendMessage" % tok,
-            data=json.dumps({"chat_id": uid, "text": text}).encode(),
-            headers={"Content-Type": "application/json"}), timeout=20)
-    except Exception:
-        pass
+        return main(note)
+    except StateCorrupt as exc:
+        # REFUSE. Running with an empty seen-set and first_run=False would reprocess every
+        # message in the 14-day window on every case and re-draft to every vendor at once.
+        msg = ("\U0001f6a8 merchandise-return engine REFUSED TO RUN: its state file is "
+               "corrupt.\n%s\n\nNothing was classified, commented or queued. Inspect the file; "
+               "if it is unrecoverable, DELETE it — an absent state file is handled correctly "
+               "(it establishes a fresh baseline and acts on nothing)." % exc)
+        print(msg)
+        heartbeat.log_error("mer-engine", msg)
+        _alert(msg, "state-corrupt", 3600)
+        note("state file corrupt — refused to run")
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
+    # M46 — every tick writes {name, ts, ok, err}, whether it succeeded, failed, or crashed.
+    # A crash also alerts with the traceback and a named diagnosis (Multica 401, dead Google
+    # refresh token, network). This is what makes "the engine has not run since Tuesday" and
+    # "the engine ran and did nothing" two different, both-detectable states.
+    sys.exit(heartbeat.guard(
+        "mer-engine", _run, expect_seconds=5400.0,
+        window={"hours": [13, 24], "dows": [0, 1, 2, 3, 4]}))

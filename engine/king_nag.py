@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-king_nag.py - escalating reminder for King, sourced from Multica (v3 2026-07-20).
+king_nag.py - escalating reminder for the engine's OWNER, sourced from Multica (v3 2026-07-20).
+
+NAMING (M47): this file is packaged and handed to strangers, so the operator's name has been
+taken out of the prose and out of every string a user reads. The MODULE name `king_nag` and the
+function name `send_telegram` are deliberately UNCHANGED: heartbeat.alert() does
+`import king_nag; king_nag.send_telegram(...)` by name, and cron wrappers invoke the file by
+path. Renaming either would break callers silently, which is a worse defect than a legacy name.
+The board-state keys (`needs_king`, `king_action`) and the `KING-ACTION:` description block are
+likewise untouched — they are a parsed contract owned by multica_board_state.py, and a user who
+writes the block the docs describe must still have it recognised.
 
 Data sources (all on the VPS, read fresh each run):
   /opt/data/multica_state.json    - Multica board state, pushed ~9:10 AM CT by
-                                     Multica/scripts/multica_export.py (King's
+                                     Multica/scripts/multica_export.py (the operator's
                                      laptop, all workspaces). Carries items[] and
                                      alerts[] (pipeline-health, e.g. a sweep that
                                      failed to run at all).
@@ -16,13 +25,13 @@ Data sources (all on the VPS, read fresh each run):
 If the laptop was asleep and multica_state.json is stale, we still nag from
 yesterday's data - that is correct: a stale item is exactly a forgotten one.
 
-Nag ladder (King's choice 2026-07-18, unchanged):
+Nag ladder (operator's choice 2026-07-18, unchanged):
   day 0-1  : Telegram
   day 2-3  : Telegram (firmer)
   day >=4  : Telegram + IVY PHONE CALL
   deadline today/overdue : Telegram + IVY PHONE CALL
 
-Speaks when there is anything needs-King, any deadline, any pipeline ALERT, or
+Speaks when there is anything needing the owner, any deadline, any pipeline ALERT, or
 any new inbound mail on a live case. Silent otherwise - no noise on quiet days.
 Runs daily 10:00 AM CT (15:00 UTC) via hermes cron 'king-action-nag'.
 
@@ -43,6 +52,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/data/scripts")
 import mer_config  # noqa: E402  (M32 — identity comes from the profile, not a literal)
 
+# M46 — the liveness ledger. NOTE THE DIRECTION OF THE DEPENDENCY: heartbeat.alert() imports
+# king_nag lazily, INSIDE the function, precisely so this module-level import cannot become a
+# cycle. Do not move heartbeat's import of king_nag to module level.
+import heartbeat  # noqa: E402
+
 STATE = "/opt/data/multica_state.json"
 INBOUND = "/opt/data/multica_inbound.json"
 WATCHER = "/opt/data/scripts/inbox_watcher.py"
@@ -54,6 +68,23 @@ USER_PHONE = mer_config.phone()
 IVY_ESCALATE_DAYS = 4
 
 DRY_RUN = "--dry-run" in sys.argv
+
+
+def _owner_name():
+    """The profile owner's first name for the message header, or "" if unavailable.
+
+    Never raises: this is presentation. An unconfigured profile must not be able to turn a
+    reminder into a crash, and the header simply loses the name.
+    """
+    try:
+        return (mer_config.legal_name() or "").split()[0]
+    except Exception:
+        return ""
+
+
+def _header():
+    who = _owner_name()
+    return "*%s — Multica state*" % who if who else "*Multica state*"
 
 
 def load_env():
@@ -116,9 +147,25 @@ def call_ivy(purpose):
         return False
 
 
+_DEGRADED = []
+
+
+def _degraded(summary, key, detail=""):
+    """Record a sub-step failure: printed, logged unbounded, alerted, and — crucially —
+    remembered so the nag itself can say out loud that it is running on partial data."""
+    _DEGRADED.append(summary)
+    print("!! %s" % summary)
+    if DRY_RUN:
+        return
+    heartbeat.log_error("mer-king-nag", "%s\n%s" % (summary, detail))
+    heartbeat.alert("⚠️ king_nag is running DEGRADED: %s%s"
+                    % (summary, ("\n\n" + detail) if detail else ""),
+                    key="king-nag:%s" % key, cooldown=6 * 3600)
+
+
 def run_board_state():
     """Refresh multica_state.json from the LIVE Multica board (VPS-side, via
-    Lisa's token) so the review works whether or not King's laptop is awake.
+    the server-side token) so the review works whether or not the operator's laptop is awake.
     Non-fatal: on any failure we fall back to whatever state file is present."""
     gen = "/opt/data/scripts/multica_board_state.py"
     if not os.path.exists(gen):
@@ -126,8 +173,15 @@ def run_board_state():
     try:
         res = subprocess.run(["python3", gen], capture_output=True, text=True, timeout=60)
         print("board_state rc=%s out=%s" % (res.returncode, (res.stdout or "").strip()[:200]))
+        if res.returncode != 0:
+            # M46: "non-fatal" is not the same as "unremarkable". A refresh that keeps failing
+            # means the nag is running off a frozen snapshot of the board and will happily
+            # report last week's state as today's, with no visible difference.
+            _degraded("board state refresh exited %s" % res.returncode,
+                      "board-state-refresh", (res.stderr or res.stdout or "")[:600])
     except Exception as exc:
         print("board_state refresh failed (non-fatal, using existing state): %s" % exc)
+        _degraded("board state refresh failed: %s" % exc, "board-state-refresh")
 
 
 def run_watcher():
@@ -140,8 +194,18 @@ def run_watcher():
     try:
         res = subprocess.run(["python3", WATCHER], capture_output=True, text=True, timeout=120)
         print("watcher rc=%s out=%s" % (res.returncode, (res.stdout or "").strip()[:200]))
+        if res.returncode != 0:
+            # M46: a broken watcher used to cost exactly one log line. But this nag's "NEW MAIL"
+            # section is sourced entirely from the watcher's output file — so a dead watcher
+            # makes the nag print a confident, complete-looking message with the mail section
+            # silently missing. That is the single most dangerous shape a failure can take here.
+            _degraded("inbox_watcher exited %s — the NEW MAIL section of this nag is NOT "
+                      "trustworthy" % res.returncode, "watcher-run",
+                      (res.stderr or res.stdout or "")[:600])
     except Exception as exc:
         print("watcher run failed (non-fatal): %s" % exc)
+        _degraded("inbox_watcher could not be run (%s) — the NEW MAIL section of this nag is "
+                  "NOT trustworthy" % exc, "watcher-run")
 
 
 def load_inbound():
@@ -237,26 +301,41 @@ def build_message(state, inbound):
         lines.append("_%d other open item(s) in progress, no action needed._" % len(other_open))
 
     gen = state.get("generated_at", "")
-    msg = "*King — Multica state*\n_as of %s_\n\n" % gen + "\n".join(lines)
+    msg = _header() + "\n_as of %s_\n\n" % gen + "\n".join(lines)
     return msg, urgent
 
 
-def main():
+def main(note=None):
+    note = note or (lambda text: None)
+    del _DEGRADED[:]
     run_board_state()
     run_watcher()
 
     if not os.path.exists(STATE):
-        print("no state file at %s - nothing to do" % STATE)
-        return
+        # Not "nothing to do" — nothing KNOWN. Say so rather than exiting quietly with the
+        # cheerful message of a clean day.
+        msg = "no state file at %s - the nag has no board data at all" % STATE
+        print(msg)
+        note(msg)
+        _degraded(msg, "no-state-file")
+        return 1
 
     with open(STATE, encoding="utf-8") as fh:
         state = json.load(fh)
     inbound = load_inbound()
 
     msg, urgent = build_message(state, inbound)
+    if _DEGRADED:
+        # The nag must never look complete when it is not. This line goes INTO the message a
+        # human reads, not only into a log they do not.
+        warn = ("*⚠ THIS REPORT IS INCOMPLETE*\n" +
+                "\n".join("- %s" % d for d in _DEGRADED) + "\n")
+        msg = (msg + "\n\n" + warn) if msg else (_header() + "\n\n" + warn)
+        for d in _DEGRADED:
+            note(d)
     if not msg:
         print("nothing needs-King, no deadlines, no alerts, no new mail - staying silent")
-        return
+        return 0
 
     send_telegram(msg)
 
@@ -268,7 +347,13 @@ def main():
                  % (first_name, titles))
     else:
         print("no ivy escalation needed")
+    return 1 if _DEGRADED else 0
 
 
 if __name__ == "__main__":
-    main()
+    if DRY_RUN:
+        sys.exit(main())
+    # M46 — beat on every run. This job is the operator's daily read of the whole system; if it
+    # stops firing, the most likely way to notice used to be "the operator realises they have not been
+    # nagged in a while", which is not a monitoring strategy.
+    sys.exit(heartbeat.guard("mer-king-nag", main, expect_seconds=108000.0))

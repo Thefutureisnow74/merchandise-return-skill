@@ -17,16 +17,20 @@ WHAT IT DOES (in order, and it stops at the first hard failure)
   1. Verifies the Multica connection and the token       (read-only, fails LOUDLY)
   2. Adopts or creates the user's WORKSPACE
   3. Adopts or creates a PROJECT to hold cases
-  4. Adopts or creates the eight MR PROPERTIES (the schema the engine reads by NAME)
+  4. Adopts or creates the twelve MR PROPERTIES (the schema the engine reads by NAME)
   5. Reports the mailbox/OAuth status (it never invents or stores a credential)
   6. Writes a starter profile.json — LAST, and only if 1-4 all succeeded
 
 IDEMPOTENT BY DESIGN
 --------------------
 Re-running adopts everything that already exists and creates only what is missing; every
-item prints exactly one CREATED / ADOPTED / SKIPPED line. King's live board is the case
-this was designed for: it already carries six of the eight properties, so a run there must
-adopt six and create two — never duplicate, never rename.
+item prints exactly one CREATED / ADOPTED / SKIPPED line. A partly-provisioned board is the
+case this was designed for: a run there adopts every property that already exists and creates
+only the remainder — never duplicate, never rename. (The count is NOT a constant. It was
+"six of eight" when this was written; M44 added `MR Remedy Type` and M47 added the three
+properties the shipping engine was already reading — `MR Last Vendor Reply`, `MR Delay
+Explanation`, `MR Money Parties` — so MR_SCHEMA is now fifteen entries. Derive the number from
+len(MR_SCHEMA); never retype it.)
 
 SAFETY
 ------
@@ -68,6 +72,10 @@ CREATED, ADOPTED, SKIPPED, FAILED = "CREATED", "ADOPTED", "SKIPPED", "FAILED"
 #   MR Discrimination Flag                                                   -> Tier 3-D
 #   MR Remedy Map / MR Remedy Attempted                                      -> the Tier4 gate
 #   MR Remedy Type                                            -> refund_landed / close_case
+#   MR Last Vendor Reply                          -> case_tick's escalation-hold gate (written
+#                                                    by the inbound classifier in mer_engine)
+#   MR Delay Explanation                                      -> letter-templates DELAY BLOCK
+#   MR Money Parties                              -> remedy_map (chargeback / CFPB / payoff)
 # --------------------------------------------------------------------------------------
 PHASE_OPTIONS = [
     ("Intake",    "#6b7280"),
@@ -155,6 +163,67 @@ MR_SCHEMA = [
         "type": "text",
         "description": ("The lever keys actually attempted AND logged. Tier4 (court/chargeback) "
                         "opens only when this covers every key in MR Remedy Map."),
+    },
+    # ----------------------------------------------------------------------------------------
+    # M47 — three properties the SHIPPING engine already reads and writes, which this schema
+    # never created. A fresh install was therefore broken by design: the escalation-hold gate in
+    # case_tick (LAST_REPLY_PROP) reads a property nothing provisioned, so a case could advance a
+    # tier over a live vendor conversation on any board but the author's. Names and types are
+    # taken from the live board's own property definitions, because the readers resolve BY NAME.
+    # ----------------------------------------------------------------------------------------
+    {
+        "name": "MR Last Vendor Reply",
+        "type": "date",
+        "icon": "flag",
+        "description": ("Date of the most recent SUBSTANTIVE inbound reply from the vendor on "
+                        "this case, written automatically by the inbound classifier. case_tick "
+                        "reads this as the escalation-hold gate: a case must not auto-advance a "
+                        "tier while a live conversation is in flight. Autoresponders and delivery "
+                        "receipts do NOT count. A brush-off ('escalated internally') does NOT "
+                        "hold the gate per the ladder rules — only a substantive reply does."),
+    },
+    {
+        "name": "MR Delay Explanation",
+        "type": "text",
+        "description": ("Verbatim, in the user's own words: why time passed between the failure "
+                        "and the claim, and who they told at the time. Per SKILL §1.6 this is a "
+                        "LEVER, never a disqualifier — no warranty, return window or statute "
+                        "estimate may close a case on it. Feeds the DELAY BLOCK in "
+                        "letter-templates."),
+    },
+    {
+        "name": "MR Money Parties",
+        "type": "text",
+        "description": ("Money-path parties for a case: seller, manufacturer, and the THIRD "
+                        "money party (card issuer, payment processor, or financing/installment "
+                        "company) that unlocks the chargeback/CFPB/payoff levers. remedy_map "
+                        "reads it; with it blank the issuer/processor/lender lever cannot be "
+                        "assessed at all."),
+    },
+    {
+        "name": "MR Send Queued Until",
+        "type": "date",
+        "description": ("YELLOW-lane veto-window countdown. send_queue holds a drafted reply "
+                        "until this passes, then sends it unless the user vetoed. Mirrors the "
+                        "queue's own send_after onto the board so the window is visible — and "
+                        "vetoable — from the phone, not only from a JSON file on the VPS."),
+    },
+    {
+        "name": "MR Purchase Date",
+        "type": "date",
+        "description": ("Date of purchase. Anchors the statute-of-limitations watchdog. Without "
+                        "it the outer legal deadline cannot be computed and a case can quietly "
+                        "age out. Write a REAL date or leave it blank — a Jan-1 placeholder is "
+                        "how a guess becomes a fact the watchdog then trusts."),
+    },
+    {
+        "name": "MR Discovery Date",
+        "type": "date",
+        "description": ("Date the defect was discovered, or reasonably should have been. Under "
+                        "many state consumer statutes (e.g. TX DTPA) the limitations clock runs "
+                        "from DISCOVERY rather than purchase, so a long-owned item that just "
+                        "failed may still be in time. sol_watchdog prefers this when present and "
+                        "says which anchor it used. Same rule: a real date or nothing."),
     },
 ]
 

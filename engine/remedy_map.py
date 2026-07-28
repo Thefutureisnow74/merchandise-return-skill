@@ -70,6 +70,7 @@ from datetime import date, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import remedy_gate  # noqa: E402  — the single source of truth for legal lever keys
+import businessday  # noqa: E402  — "today" in the USER's timezone, never the UTC container's
 
 REMEDY_MAP_PROP = "MR Remedy Map"
 REMEDY_DONE_PROP = "MR Remedy Attempted"
@@ -372,6 +373,149 @@ def serialize(levers):
     return ", ".join(order_levers(levers))
 
 
+# ---------------------------------------------------------------------------------------
+# VALIDATION ON READ (2026-07-28)
+# ---------------------------------------------------------------------------------------
+# write() validated its own writes — but write() is not how most live maps got there. Maps
+# are also typed in by hand on the board, and case_tick read that property as FREE TEXT with
+# no validation at all. Two live consequences, both permanent:
+#
+#   * MER-76's map read `tier1_vendor, tier2_exec, state_ag, texas_dtpa, bbb_southwest,
+#     magnuson_moss, small_claims_dallas`. Four of those keys were unknown to
+#     remedy_gate.LEVER_LABELS, and log_attempt() REFUSES an unknown key by design — so those
+#     levers could never be marked attempted, and the court gate could never clear.
+#   * `small_claims_dallas` was not in COURT_LEVERS, so court itself was counted as an owed
+#     prerequisite for court.
+#
+# The map is therefore validated on READ, and an invalid map is a LOUD REFUSAL TO ADVANCE —
+# never a silent forever-hold. LEVER_ALIASES turns the plausible hand-written variants into
+# the canonical keys, but a rename is only ever SUGGESTED here: rewriting a case's map as a
+# side effect of reading it is exactly the kind of silent correction this engine must not do.
+LEVER_ALIASES = {
+    # state consumer-protection statutes, written by their local name
+    "texas_dtpa": "state_statute", "tx_dtpa": "state_statute", "dtpa": "state_statute",
+    "ca_clra": "state_statute", "clra": "state_statute", "ny_gbl": "state_statute",
+    "fl_deceptive": "state_statute", "state_udap": "state_statute", "udap": "state_statute",
+    "state_consumer_statute": "state_statute", "consumer_protection_act": "state_statute",
+    # BBB regions
+    "bbb_southwest": "bbb", "bbb_nctx": "bbb", "bbb_north_texas": "bbb",
+    "bbb_complaint": "bbb", "better_business_bureau": "bbb",
+    # regulators
+    "ftc_complaint": "ftc", "ftc_report": "ftc",
+    "attorney_general": "state_ag", "state_attorney_general": "state_ag",
+    "ag_complaint": "state_ag", "state_ag_complaint": "state_ag",
+    "cfpb": "industry_regulator", "regulator": "industry_regulator",
+    # federal warranty act
+    "mmwa": "magnuson_moss", "magnuson_moss_act": "magnuson_moss",
+    "magnuson_moss_warranty_act": "magnuson_moss",
+    # tiers
+    "tier1": "tier1_vendor", "vendor": "tier1_vendor", "vendor_contact": "tier1_vendor",
+    "tier2": "tier2_exec", "executive_escalation": "tier2_exec", "exec": "tier2_exec",
+    # pre-suit
+    "presuit": "pre_suit_notice", "pre_suit": "pre_suit_notice",
+    "demand_letter": "pre_suit_notice", "statutory_notice": "pre_suit_notice",
+    # misc
+    "arbitration_clause": "arbitration", "mediation": "nonprofit_mediation",
+    "nonprofit": "nonprofit_mediation", "class_action_check": "class_action",
+    "reviews": "online_reviews", "online_review": "online_reviews",
+    "civil_rights_complaint": "civil_rights", "discrimination": "civil_rights",
+}
+
+
+def canonical_lever(key):
+    """The canonical lever key for a hand-written variant, or the key unchanged."""
+    k = str(key or "").strip().lower()
+    return LEVER_ALIASES.get(k, k)
+
+
+def normalize_map(levers):
+    """(normalized_levers, [(original, canonical), ...]) — alias-resolved, court keys dropped.
+
+    SUGGESTION ONLY. Nothing here writes; callers show the result to a human. Court-family
+    keys are dropped because court is the destination, not a prerequisite for itself.
+    """
+    out, changes = [], []
+    for raw in parse_levers(levers):
+        canon = canonical_lever(raw)
+        if remedy_gate.is_court_lever(canon):
+            changes.append((raw, None))          # dropped: court is not a prerequisite
+            continue
+        if canon != str(raw).strip():
+            changes.append((raw, canon))
+        if canon not in out:
+            out.append(canon)
+    return order_levers(out), changes
+
+
+def validate_map(levers):
+    """(ok: bool, problems: [dict]) — is this map SATISFIABLE and non-circular?
+
+    A problem is {"lever", "kind", "detail", "suggestion"} with `kind` in:
+      * "unknown"   — remedy_gate does not know the key, so log_attempt() will REFUSE to
+                      mark it attempted and the court gate can never clear on it;
+      * "court"     — a court-family key sitting in the map as a prerequisite (circular);
+      * "empty"     — no levers at all: nothing was ever enumerated.
+    ok is True only when the map is non-empty and carries no problems.
+
+    Exported so the dashboard can render the same verdict case_tick enforces — one rule,
+    one implementation, no second copy to drift.
+    """
+    keys = parse_levers(levers)
+    problems = []
+    if not keys:
+        problems.append({
+            "lever": None, "kind": "empty",
+            "detail": ("the remedy map is EMPTY — Tier 0 never enumerated this case's levers. "
+                       "An empty map is not 'no avenues apply'; it is 'nobody looked'."),
+            "suggestion": "run remedy_map.py (Tier 0) to build the map",
+        })
+        return False, problems
+    for k in keys:
+        canon = canonical_lever(k)
+        if remedy_gate.is_court_lever(k) or remedy_gate.is_court_lever(canon):
+            problems.append({
+                "lever": k, "kind": "court",
+                "detail": ("%r is the COURT destination, not a prerequisite. Left in the map "
+                           "it makes court an owed condition of reaching court — the case can "
+                           "never reach Tier 4." % k),
+                "suggestion": "remove %r from %s" % (k, REMEDY_MAP_PROP),
+            })
+            continue
+        if canon not in remedy_gate.LEVER_LABELS:
+            problems.append({
+                "lever": k, "kind": "unknown",
+                "detail": ("%r is not a lever remedy_gate knows, so remedy_map.log_attempt() "
+                           "REFUSES to mark it attempted (by design — a typo must not be able "
+                           "to claim a real lever was pulled). It can therefore NEVER be "
+                           "satisfied, and the court gate holds forever." % k),
+                "suggestion": ("rename to a known key (%s)"
+                               % ", ".join(sorted(x for x in remedy_gate.LEVER_LABELS
+                                                  if not remedy_gate.is_court_lever(x)))),
+            })
+        elif canon != str(k).strip():
+            # Known only via an alias: still a problem, because the property as written is
+            # what log_attempt() compares against.
+            problems.append({
+                "lever": k, "kind": "unknown",
+                "detail": ("%r is a hand-written variant of the known lever %r. As written it "
+                           "is not a key log_attempt() accepts, so it can never be satisfied."
+                           % (k, canon)),
+                "suggestion": "rename %r -> %r" % (k, canon),
+            })
+    return (not problems), problems
+
+
+def describe_problems(problems, case=None):
+    """One-line-per-problem rendering of validate_map()'s output, for logs and alerts."""
+    if not problems:
+        return ""
+    head = "%s: " % case if case else ""
+    return "; ".join("%s%s [%s] %s (%s)"
+                     % (head, p.get("lever") or "(map)", p["kind"], p["detail"],
+                        p["suggestion"])
+                     for p in problems)
+
+
 def order_levers(levers):
     seen, out = set(), []
     for k in LEVER_ORDER:
@@ -453,7 +597,7 @@ def money_trail(case, hay, today=None):
     not owed. Putting a chargeback in the blocking map would let a cash case block itself
     out of court permanently.
     """
-    today = today or date.today()
+    today = today or businessday.today()   # user-timezone today (UTC container rolls over early)
     levers, notes = [], []
     explicit = str(case.get("payment_method") or "").lower()
     text = _hay(hay, explicit)
@@ -531,7 +675,7 @@ def build(case, today=None):
           "state", "county", "statute", "presuit", "civil_rights_avenue", "cap"
         }
     """
-    today = today or date.today()
+    today = today or businessday.today()   # user-timezone today (UTC container rolls over early)
     levers, why, excl, notes, verify = [], {}, {}, [], []
 
     hay = _hay(case.get("title"), case.get("description"), case.get("vendor"),
@@ -813,14 +957,13 @@ def write(issue, levers, defs=None, ws=None):
     if not levers:
         raise ValueError("refusing to write an EMPTY remedy map — a blank map fails the court "
                          "gate closed and reads as 'never investigated'")
-    unknown = [k for k in levers if k not in remedy_gate.LEVER_LABELS]
-    if unknown:
-        raise ValueError("lever key(s) %s are not known to remedy_gate — the gate would hold "
-                         "court on a lever nothing can satisfy" % unknown)
-    court = [k for k in levers if k in remedy_gate.COURT_LEVERS]
-    if court:
-        raise ValueError("refusing to write court lever(s) %s into the map — court is the "
-                         "destination, not a prerequisite" % court)
+    # Same validator case_tick applies on READ, so a written map and a hand-typed map are
+    # held to one identical standard (they were not before: write() checked its own writes
+    # while the read path accepted anything at all).
+    ok, problems = validate_map(levers)
+    if not ok:
+        raise ValueError("refusing to write an unsatisfiable remedy map — %s"
+                         % describe_problems(problems))
     _api().set_properties(issue, {REMEDY_MAP_PROP: serialize(levers)}, defs=defs, ws=ws)
     return levers
 
@@ -943,7 +1086,7 @@ def log_attempt(case, lever, *, live=False, issues=None, ws=None, defs=None, api
         v["refused"] = True
         v["reason"] = "REFUSED: no lever key given."
         return v
-    if key in remedy_gate.COURT_LEVERS:
+    if remedy_gate.is_court_lever(key):
         v["refused"] = True
         v["reason"] = ("REFUSED: %r is a COURT lever. Court is the destination the gate "
                        "protects, not a prerequisite for itself." % key)
@@ -953,7 +1096,7 @@ def log_attempt(case, lever, *, live=False, issues=None, ws=None, defs=None, api
         v["reason"] = ("REFUSED: %r is not a lever remedy_gate knows (%s). A typo here "
                        "would leave the REAL lever owed while the log claims it is done."
                        % (key, ", ".join(sorted(k for k in remedy_gate.LEVER_LABELS
-                                                if k not in remedy_gate.COURT_LEVERS))))
+                                                if not remedy_gate.is_court_lever(k)))))
         return v
 
     # Resolve the case to a real issue, without inventing one.
@@ -1173,7 +1316,7 @@ def _selftest():
     check("E: every emitted key is in remedy_gate.LEVER_LABELS", not unknown, "stray=%s" % unknown)
     check("E: LEVER_ORDER itself is a subset of remedy_gate.LEVER_LABELS",
           not set(LEVER_ORDER) - set(remedy_gate.LEVER_LABELS))
-    court = sorted(emitted & remedy_gate.COURT_LEVERS)
+    court = sorted(k for k in emitted if remedy_gate.is_court_lever(k))
     check("E: no COURT lever is ever emitted (court never gates on itself)", not court, court)
     print("   emitted taxonomy: %s" % ", ".join(order_levers(emitted)))
 
@@ -1201,7 +1344,7 @@ def _selftest():
         write({"id": "x"}, ["bbb", "made_up_lever"])
         ok_unknown = False
     except ValueError as e:
-        ok_unknown = "not known to remedy_gate" in str(e)
+        ok_unknown = "not a lever remedy_gate knows" in str(e)
     check("F: write() refuses a key remedy_gate does not know", ok_unknown)
     try:
         write({"id": "x"}, ["bbb", "tier4_court"])
@@ -1218,6 +1361,50 @@ def _selftest():
           m2 == ["state_ag", "bbb", "ftc"], m2)
     check("F: logging onto an empty property works", m3 == ["tier1_vendor"], m3)
     check("F: serialize/parse round-trips", parse_levers(serialize(a["levers"])) == a["levers"])
+
+    # ------------------------------------------------------ F2. validate_map ON READ
+    # The defect this closes: write() guarded its own writes, but maps are ALSO typed in by
+    # hand and case_tick read the property as free text with no validation whatsoever. Both
+    # inputs below are the REAL live values off the board on 2026-07-28.
+    print("\nF2. validate_map() — the read-side guard hand-written maps used to bypass")
+    mer76 = ("tier1_vendor, tier2_exec, state_ag, texas_dtpa, bbb_southwest, "
+             "magnuson_moss, small_claims_dallas")
+    ok76, pr76 = validate_map(mer76)
+    kinds76 = sorted({p["kind"] for p in pr76})
+    bad76 = sorted(p["lever"] for p in pr76)
+    check("F2: MER-76's live hand-written map is REJECTED", ok76 is False,
+          "problems: %s" % bad76)
+    check("F2: ...the venue-suffixed court key is called out as CIRCULAR",
+          "court" in kinds76 and "small_claims_dallas" in bad76,
+          "court is not a prerequisite for court")
+    check("F2: ...and the alias keys are called out as UNSATISFIABLE",
+          {"texas_dtpa", "bbb_southwest"} <= set(bad76),
+          "log_attempt() refuses them by design, so they could never be satisfied")
+    check("F2: magnuson_moss is now a KNOWN lever (it is a real avenue)",
+          "magnuson_moss" not in bad76,
+          "added to remedy_gate.LEVER_LABELS rather than left unsatisfiable")
+    norm76, changes76 = normalize_map(mer76)
+    check("F2: normalize_map() SUGGESTS a satisfiable map",
+          validate_map(norm76)[0] is True, serialize(norm76))
+    check("F2: ...with the court key dropped, not renamed",
+          not any(remedy_gate.is_court_lever(k) for k in norm76),
+          "%d rename(s)/drop(s): %s" % (len(changes76), changes76))
+    import inspect
+    check("F2: normalisation is SUGGESTED, never applied on read",
+          not any("set_properties" in inspect.getsource(fn) or "_api(" in inspect.getsource(fn)
+                  for fn in (validate_map, normalize_map, canonical_lever)),
+          "neither validator nor normaliser can touch the board")
+
+    ok74, pr74 = validate_map("tier1_vendor, tier2_exec, industry_regulator, state_statute, "
+                              "state_ag, bbb, ftc, class_action, pre_suit_notice")
+    check("F2: MER-74's live map passes (every key is known + satisfiable)", ok74 is True,
+          "%d problem(s)" % len(pr74))
+    okE, prE = validate_map("")
+    check("F2: an EMPTY map is a validation problem in its own right",
+          okE is False and prE[0]["kind"] == "empty", prE[0]["detail"][:60])
+    check("F2: describe_problems() renders every problem for a log line",
+          all(p["lever"] in describe_problems(pr76) for p in pr76 if p["lever"]),
+          describe_problems(pr76)[:80] + "...")
 
     # F3 — log_attempt(): the call site mark_attempted never had. Offline, stubbed board.
     class _StubMC(object):
@@ -1295,7 +1482,7 @@ def _selftest():
           set(PHASE_LEVER.values()) <= set(remedy_gate.LEVER_LABELS),
           str(sorted(set(PHASE_LEVER.values()) - set(remedy_gate.LEVER_LABELS))))
     check("F3: no PHASE_LEVER maps a phase to a COURT lever",
-          not (set(PHASE_LEVER.values()) & remedy_gate.COURT_LEVERS))
+          not any(remedy_gate.is_court_lever(k) for k in PHASE_LEVER.values()))
     check("F3: Tier3 is NOT auto-mapped (it is four separate filings)",
           "Tier3" not in PHASE_LEVER)
     print()
@@ -1307,18 +1494,25 @@ def _selftest():
     # that cannot send reported that it could — and the whole self-test exited 1 while printing
     # PASS. A structural claim has to be checked against structure; prose defeats a substring
     # match, which is the same trap case_tick's --live gate hit.
+    #
+    # The SET is imported, not retyped. The hand-maintained copy that used to live here read
+    # {"mer_send", "send_queue", "smtplib"} — it omitted "gmail_transport", which is precisely
+    # the import that produced a duplicate vendor email. A private copy of a safety-critical set
+    # drifts silently; check_wiring.SEND_MODULES is the one canonical list and check_wiring's own
+    # self-test asserts the transport is in it.
     import ast as _ast
+    import check_wiring as _cw
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
-    _send_mods = {"mer_send", "send_queue", "smtplib"}
+    _send_mods = set(_cw.SEND_MODULES)
     _imported = set()
     for _node in _ast.walk(_ast.parse(src)):
         if isinstance(_node, _ast.Import):
             _imported.update(a.name.split(".")[0] for a in _node.names)
         elif isinstance(_node, _ast.ImportFrom) and _node.module:
             _imported.add(_node.module.split(".")[0])
-    check("F: Tier 0 has no send path (no smtp/mer_send/send_queue import)",
+    check("F: Tier 0 has no send path (imports none of check_wiring.SEND_MODULES)",
           not (_imported & _send_mods),
-          "real imports checked: %d" % len(_imported))
+          "checked %d import(s) against %s" % (len(_imported), ",".join(sorted(_send_mods))))
     print()
 
     print("--- sample RECORD-ONLY output (case B) " + "-" * 32)

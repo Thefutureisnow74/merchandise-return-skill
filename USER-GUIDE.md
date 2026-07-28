@@ -84,8 +84,8 @@ than guessing — it never fails open.
 
 ### 3a. Put the skill somewhere your assistant can see it
 
-Copy the whole `merchandise-return/` folder (this file, `SKILL.md`, and `references/`) into your
-skills directory:
+Copy the whole `merchandise-return/` folder (this file, `SKILL.md`, `references/`, and `engine/` —
+all the Python lives in `engine/`) into your skills directory:
 
 - **Claude Code:** `~/.claude/skills/merchandise-return/`
 - **An agent runtime (e.g. a Telegram agent):** that runtime's skills directory.
@@ -138,23 +138,29 @@ failures that kill a case, and only a clock catches a non-event.
 
 ```
 cd engine
-python3 scheduler.py --install          # prints the plan, changes nothing
-python3 scheduler.py --install --live   # actually installs it
-python3 scheduler.py --status           # what is installed, and when did it last run?
+python scheduler.py --install          # prints the plan, changes nothing
+python scheduler.py --install --live   # actually installs it
+python scheduler.py --status           # what is installed, and when did it last run?
 ```
 
 It works out what your machine uses — cron, systemd timers, or Windows Task Scheduler — and installs
-six jobs: the mail loop (business hours), the daily case tick, the calendar sync, a bounce check
-three times a day, and two Monday-morning sweeps. On a host with no scheduler at all,
-`python3 scheduler.py --run-forever` **is** the clock.
+**nine** jobs. Two of them run around the clock: a hot path **every minute, 24/7** that fires the
+moment a reply lands, and a watchdog every ten minutes. The rest are business-hours or daily: the
+hourly mail loop, the send queue, the **daily case tick at 09:00 CT that advances your ladder**, the
+calendar sync, a bounce check three times a day, and two Monday-morning sweeps. On a host with no
+scheduler at all, `python scheduler.py --run-forever` **is** the clock.
 
-Three things worth knowing now:
+Four things worth knowing now:
 
 - **`--dry-run` is the default.** Nothing touches your crontab until you type `--live`.
-- **It ships in `test` mode.** For your first week every drafted reply is redirected to your own
-  mailbox, not a vendor's. See section 5 for the switch.
-- **Silence means healthy.** Five of the six jobs print nothing when all is well, on purpose. Full
-  detail always goes to a log next to the engine.
+- **Every schedule in the manifest is written in UTC**, with the US-Central time it corresponds to
+  spelled out next to it. If you are not on Central time, read those notes before assuming when a
+  job runs.
+- **It ships in `test` mode** (`MER_ENGINE_SEND: "test"` in `schedule.json`). Every drafted reply is
+  redirected to your own mailbox, not a vendor's, **until you change that value and reinstall**. See
+  section 5 for the switch.
+- **Silence means healthy.** Most jobs print nothing when all is well, on purpose. Full detail
+  always goes to a log next to the engine.
 
 Full detail — editing the schedule, pointing it at a different Python, container prefixes,
 troubleshooting: **`references/scheduler.md`**.
@@ -200,7 +206,16 @@ later is aimed at the targets on that map.
 **Read this twice.** The engine can send email from your own account, under your own name. Once a
 message is delivered you cannot recall it. This is the only irreversible thing the system does.
 
-Actions are sorted into three lanes.
+Actions are sorted into three lanes. **`SKILL.md` §5 is the authoritative definition** — it carries
+the test the engine applies to an action nobody listed in advance. This section is the plain-English
+version of the same rules; where they ever differ, §5 wins.
+
+The short form of the test: an action is **RED** if any of these is true — it reaches a party this
+case has never contacted, it becomes a public or government record, it is visible to anyone besides
+you and the vendor, it moves money, it forfeits a right, it ends the case, or it asserts a legal
+claim. It is **YELLOW** only if all of these are true — the recipient already wrote to you on this
+case, it is private one-to-one email, it asserts nothing new, and every fact in it is already on the
+record. **Anything you cannot place with certainty is RED.**
 
 ### GREEN — always automatic, no permission asked
 
@@ -229,6 +244,11 @@ Two things, and only two:
 
 **Default veto window: 3 hours** (`MER_ENGINE_WINDOW_HOURS=3`). You get three hours to kill it.
 
+> ⚠️ **This lane is switched off in the box.** The shipped schedule sets `MER_ENGINE_SEND=test`, so
+> every "sent" letter is actually redirected to your own mailbox with a `[TEST]` banner. Nothing in
+> the Yellow lane reaches a vendor until you change that value in your own `schedule.json` and
+> reinstall the schedule. If you are waiting for a letter to go out, check this first.
+
 If a case's inbound mail is coming from someone who is not the vendor — a friend or relative whose
 problem you are helping with — that mail is **never** auto-replied to. It is only surfaced to you.
 
@@ -242,6 +262,15 @@ problem you are helping with — that mail is **never** auto-replied to. It is o
 - **Signing anything.**
 - **Sending a legal threat.**
 - **Closing a case.**
+- **A BBB complaint, a public social post, contacting a TV consumer reporter, or an elected
+  official's casework form.** Every one of these is a public or third-party record.
+- **Anything on the civil-rights track.** A civil-rights complaint is sworn under penalty of
+  perjury, and you are the one swearing it.
+- **Filing a chargeback — and also withdrawing one.** Both move money or give up a remedy.
+
+One thing that is never a lever, in any lane: **you may not offer to withhold a regulator complaint,
+a BBB complaint, or publicity in exchange for being paid.** Saying you intend to sue is normal and
+lawful. Selling silence about a complaint is coercion, and the engine will not draft it.
 
 Also red by classification: any reply classified `refused`, `legal_threat`,
 `discrimination_signal`, or `refund` is surfaced to you and never auto-answered. Those are the four
@@ -257,8 +286,8 @@ one, file one, pay for one, or end one without you.
 ### Veto one queued send
 
 ```
-python3 send_queue.py --list            # every queued send, its id, recipient, and countdown
-python3 send_queue.py --veto <id>       # kill that one; it is dropped, not sent
+python send_queue.py --list            # every queued send, its id, recipient, and countdown
+python send_queue.py --veto <id>       # kill that one; it is dropped, not sent
 ```
 
 A vetoed record is dropped permanently on the next pass. It does not come back.
@@ -267,7 +296,7 @@ A vetoed record is dropped permanently on the next pass. It does not come back.
 
 The single switch is the environment variable `MER_ENGINE_SEND`, set per job in the schedule
 manifest (`schedule.json` — copy `schedule.json.example` and edit your copy, then re-run
-`python3 scheduler.py --install --live`):
+`python scheduler.py --install --live`):
 
 | Value | Effect |
 |---|---|
@@ -283,7 +312,7 @@ send, addressed to you, before a vendor ever gets one.
 Take the clock away:
 
 ```
-python3 scheduler.py --uninstall --live
+python scheduler.py --uninstall --live
 ```
 
 That removes every job it installed — and nothing else. The engine has no other way to act; it does
@@ -332,7 +361,7 @@ the case tick runs daily in the morning, the calendar sync runs daily. Nothing h
 weekends, or while the host is off. If a deadline passes while the machine is down, it is caught on
 the next run — late, not lost.
 
-**Deadlines are business-day math.** "7 business days" from a Friday is not Friday + 7. Weekends and
+**Deadlines are business-day math.** "5 business days" from a Friday is not Friday + 5. Weekends and
 US federal holidays are excluded. If a deadline looks wrong to you, check the calendar date rather
 than the day count — this is a genuine, repeated source of error and it is worth your sanity check.
 

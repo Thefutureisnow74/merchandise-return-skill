@@ -1,0 +1,117 @@
+#!/bin/sh
+#
+# pre-commit — the structural gates, run before anything can enter history.
+#
+# WHY THIS HOOK EXISTS
+# --------------------
+# Three failures, all of the same shape: a rule that lived in a document instead of in a
+# machine.
+#
+#   2026-07-26  SEVEN safety modules (remedy_gate, refund_landed, sol_watchdog, dup_guard,
+#               delivery_check, unmatched_review, businessday) were built, self-tested,
+#               marked done — and imported by nothing. The repo recorded invariants as
+#               "enforced" that were held up only by a human doing those steps by hand.
+#
+#   2026-07-18/25/28  Modules hand-rolled their own `_BANNED_IMPORTS` denylists to keep
+#               themselves off the send path. Each list was typed out separately, so they
+#               drifted (remedy_map's omitted "gmail_transport"; mer_dashboard's did not),
+#               and a module that never opted in was never checked at all.
+#
+#   2026-07-28  "$2,500" reached the board as ",500". A multi-line value containing a `$`
+#               went unquoted through a shell to the `multica` CLI. Nothing raised. The
+#               mangled figure entered a client record.
+#
+# Documents did not stop any of these. This hook does, at the last moment where the fix is
+# still cheap.
+#
+# WHAT IT RUNS
+#   check_wiring.py --wiring       every module has a live call site (import / schedule /
+#                                  subprocess), or an allowlist entry WITH A WRITTEN REASON
+#   check_wiring.py --send-path    one repo-wide rule for who may import gmail_transport and
+#                                  who may call send_mime()
+#   check_wiring.py --board-write  no board WRITE is built by interpolating a value into a
+#                                  shell command line, anywhere in the repo
+#
+# It runs no self-tests, touches no network, writes to no board, and cannot send mail.
+# Typical run time is well under a second, which is the point: a slow hook is a hook people
+# disable.
+#
+# INSTALL       sh scripts/vps/hooks/install.sh
+# UNINSTALL     sh scripts/vps/hooks/install.sh --uninstall
+# RUN BY HAND   python3 scripts/vps/check_wiring.py
+#
+# BYPASS
+#   git commit --no-verify
+#
+#   That is the ONLY way past this hook. There is deliberately no environment variable, no
+#   marker file, and no "known violations" ledger — every one of those is a bypass you can
+#   trip over by accident, or leave switched on and forget. `--no-verify` has to be typed,
+#   every single time, and it shows up in shell history. Bypassing is allowed; bypassing
+#   without noticing is not.
+
+set -u
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "pre-commit: not inside a git work tree — skipping structural gates" >&2
+    exit 0
+}
+# Resolve the gate RELATIVE TO THIS HOOK, not to a hardcoded scripts/vps. The engine ships
+# as a skill package where the directory is named something else; a hook that only knows one
+# layout is a hook that silently no-ops in the other one.
+HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+GATE="$HOOK_DIR/../check_wiring.py"
+[ -f "$GATE" ] || GATE="$REPO_ROOT/scripts/vps/check_wiring.py"
+
+if [ ! -f "$GATE" ]; then
+    echo "pre-commit: $GATE is missing — cannot verify structure." >&2
+    echo "            Restore it or run: git commit --no-verify" >&2
+    exit 1
+fi
+
+# Pick an interpreter. The engine venv first (that is what cron uses), then whatever the
+# host calls python. A hook that dies on 'python3: not found' teaches people --no-verify.
+PY=""
+for cand in /opt/hermes/.venv/bin/python3 python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+done
+if [ -z "$PY" ]; then
+    echo "pre-commit: no python interpreter found — cannot verify structure." >&2
+    echo "            Install python3 or run: git commit --no-verify" >&2
+    exit 1
+fi
+
+FAILED=0
+
+# Gates 1 + 2 — scoped to the engine directory, which is where modules and the send path live.
+"$PY" "$GATE" --wiring --send-path || FAILED=1
+
+# Gate 3 — the $2,500 bug can be committed anywhere in the repo, not just in scripts/vps,
+# so this one walks the whole tree.
+"$PY" "$GATE" --board-write --board-write-root "$REPO_ROOT" || FAILED=1
+
+if [ "$FAILED" -ne 0 ]; then
+    cat >&2 <<'MSG'
+
+================================================================================
+COMMIT BLOCKED — a structural gate failed.
+
+A module that passes its own self-test and is wired into nothing is NOT done.
+"Definition of Done = the self-test is green" is the exact defect that produced
+seven dead safety modules on 2026-07-26. Definition of Done is: a live call site
+exists, and this hook can see it.
+
+Fix the violation named above. If it is genuinely an entry point or a
+library-by-design, add it to the matching allowlist in scripts/vps/check_wiring.py
+WITH A WRITTEN REASON — an allowlist line is a visible decision in `git diff`,
+which is the whole reason the reason is mandatory.
+
+To commit anyway, deliberately:
+
+    git commit --no-verify
+
+================================================================================
+MSG
+    exit 1
+fi
+
+exit 0

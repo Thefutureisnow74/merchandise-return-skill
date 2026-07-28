@@ -9,13 +9,113 @@ the letter's real deadline (7 business days from Fri 2026-07-17) is end of Tue 2
 
 A "business day" here = Monday–Friday and NOT a US federal holiday (observed-day adjusted).
 
+⚠️ TIMEZONE (2026-07-28). Every deadline decision in this engine is DATE-ONLY, and the
+container runs UTC. `date.today()` under UTC is already TOMORROW from 19:00 America/Chicago
+onward (18:00 in winter), so a phase deadline could elapse — and an escalation fire — a full
+calendar day early, every single evening. Nothing in the engine may call `date.today()` for a
+decision that drives a deadline. Call `businessday.today()` instead: it resolves "today" in the
+USER'S timezone (profile `timezone`, default America/Chicago, env override MER_TIMEZONE).
+
 Public API:
+    today(tz=None) -> date                           # "today" in the profile's timezone
+    now(tz=None) -> datetime                         # tz-aware now, same zone
+    profile_timezone() -> str
     is_business_day(d) -> bool
     add_business_days(start_date, n) -> date        # n business days on/after start (n>=0 walks forward)
     business_day_deadline(start_date, n) -> date     # the date that is n business days AFTER start_date
+    federal_holidays_named(year) -> {name: date}
     US_FEDERAL_HOLIDAYS_2026  -> frozenset[date]
 """
-from datetime import date, timedelta
+import json
+import os
+from datetime import date, datetime, timedelta, timezone, tzinfo
+
+# ---------------------------------------------------------------------------------------
+# Timezone — "today" is the USER'S today, never the container's.
+# ---------------------------------------------------------------------------------------
+DEFAULT_TZ = "America/Chicago"
+_PROFILE_PATHS = (
+    os.environ.get("MER_PROFILE") or "",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile.json"),
+    "/opt/data/scripts/profile.json",
+)
+
+
+def profile_timezone():
+    """The engine's operating timezone: $MER_TIMEZONE, else profile.json `timezone`, else CT.
+
+    Deliberately tolerant — a missing/unreadable profile falls back to the documented
+    default rather than raising, because the alternative (silently using UTC) is the bug.
+    """
+    env = (os.environ.get("MER_TIMEZONE") or "").strip()
+    if env:
+        return env
+    for path in _PROFILE_PATHS:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                tz = (json.load(fh) or {}).get("timezone")
+            if tz:
+                return str(tz).strip()
+        except Exception:
+            continue
+    return DEFAULT_TZ
+
+
+class _USCentral(tzinfo):
+    """Last-resort US Central implementation for hosts with no tz database.
+
+    Only used when zoneinfo cannot load the requested zone. Implements the post-2007 US
+    rule: DST from the 2nd Sunday in March 02:00 to the 1st Sunday in November 02:00.
+    Being approximate is fine here — being UTC is not.
+    """
+
+    def _dst_bounds(self, year):
+        # 2nd Sunday in March, 1st Sunday in November (weekday Sun == 6)
+        start = _nth_weekday(year, 3, 6, 2)
+        end = _nth_weekday(year, 11, 6, 1)
+        return (datetime(start.year, start.month, start.day, 2),
+                datetime(end.year, end.month, end.day, 2))
+
+    def utcoffset(self, dt):
+        return timedelta(hours=-5) if self._is_dst(dt) else timedelta(hours=-6)
+
+    def dst(self, dt):
+        return timedelta(hours=1) if self._is_dst(dt) else timedelta(0)
+
+    def tzname(self, dt):
+        return "CDT" if self._is_dst(dt) else "CST"
+
+    def _is_dst(self, dt):
+        if dt is None:
+            return False
+        naive = dt.replace(tzinfo=None)
+        start, end = self._dst_bounds(naive.year)
+        return start <= naive < end
+
+
+def _tzinfo(name=None):
+    name = name or profile_timezone()
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return _USCentral()
+
+
+def now(tz=None):
+    """Timezone-aware 'now' in the engine's operating timezone."""
+    return datetime.now(timezone.utc).astimezone(_tzinfo(tz))
+
+
+def today(tz=None):
+    """TODAY IN THE USER'S TIMEZONE — the only 'today' a deadline decision may use.
+
+    `date.today()` on a UTC container rolls over at 19:00 Central. Every deadline
+    comparison that used it could fire a full day early; this is the replacement.
+    """
+    return now(tz).date()
 
 
 def _nth_weekday(year, month, weekday, n):
@@ -44,33 +144,55 @@ def _observed(d):
     return d
 
 
+def federal_holidays_named(year):
+    """{holiday name: observed date} for a given year. ALWAYS 11 entries.
+
+    Kept as a NAME->date mapping rather than a bare set so a year in which two observed
+    dates collide is visible instead of silently shrinking the set (a dropped holiday makes
+    a deadline land one business day early — the same class of bug as the calendar/business
+    day mix-up this module exists to prevent).
+    """
+    return {
+        "New Year's Day": _observed(date(year, 1, 1)),
+        "MLK Jr. Day": _nth_weekday(year, 1, 0, 3),             # 3rd Mon Jan
+        "Washington's Birthday": _nth_weekday(year, 2, 0, 3),   # 3rd Mon Feb
+        "Memorial Day": _last_weekday(year, 5, 0),              # last Mon May
+        "Juneteenth": _observed(date(year, 6, 19)),
+        "Independence Day": _observed(date(year, 7, 4)),
+        "Labor Day": _nth_weekday(year, 9, 0, 1),               # 1st Mon Sep
+        "Columbus / Indigenous Peoples' Day": _nth_weekday(year, 10, 0, 2),  # 2nd Mon Oct
+        "Veterans Day": _observed(date(year, 11, 11)),
+        "Thanksgiving": _nth_weekday(year, 11, 3, 4),           # 4th Thu Nov
+        "Christmas Day": _observed(date(year, 12, 25)),
+    }
+
+
 def _us_federal_holidays(year):
     """The observed dates of the 11 US federal holidays for a given year."""
-    holidays = {
-        _observed(date(year, 1, 1)),          # New Year's Day
-        _nth_weekday(year, 1, 0, 3),          # MLK Jr. Day — 3rd Mon Jan
-        _nth_weekday(year, 2, 0, 3),          # Washington's Birthday — 3rd Mon Feb
-        _last_weekday(year, 5, 0),            # Memorial Day — last Mon May
-        _observed(date(year, 6, 19)),         # Juneteenth
-        _observed(date(year, 7, 4)),          # Independence Day
-        _nth_weekday(year, 9, 0, 1),          # Labor Day — 1st Mon Sep
-        _nth_weekday(year, 10, 0, 2),         # Columbus / Indigenous Peoples' — 2nd Mon Oct
-        _observed(date(year, 11, 11)),        # Veterans Day
-        _nth_weekday(year, 11, 3, 4),         # Thanksgiving — 4th Thu Nov
-        _observed(date(year, 12, 25)),        # Christmas Day
-    }
-    return frozenset(holidays)
+    return frozenset(federal_holidays_named(year).values())
 
 
 # Explicit 2026 set (the engine's operating year) — usable as a constant.
 US_FEDERAL_HOLIDAYS_2026 = _us_federal_holidays(2026)
 
 
+_HOLIDAY_CACHE = {}
+
+
 def _holidays_for(d):
-    """Holiday set for the year of d (falls back to the 2026 constant for 2026)."""
-    if d.year == 2026:
-        return US_FEDERAL_HOLIDAYS_2026
-    return _us_federal_holidays(d.year)
+    """Holiday set covering the year of d, INCLUDING neighbouring-year spillover.
+
+    New Year's Day falling on a Saturday is OBSERVED on Friday 31 December of the PREVIOUS
+    year (e.g. 2022-01-01 was a Saturday, so Fri 2021-12-31 was the federal holiday). Looking
+    only at `d.year` misses it and counts 12/31 as a business day — a deadline crossing it
+    lands a day early. The union of year-1 / year / year+1 makes that structurally impossible.
+    """
+    y = d.year
+    hit = _HOLIDAY_CACHE.get(y)
+    if hit is None:
+        hit = frozenset().union(*(_us_federal_holidays(yy) for yy in (y - 1, y, y + 1)))
+        _HOLIDAY_CACHE[y] = hit
+    return hit
 
 
 def is_business_day(d):
@@ -210,6 +332,51 @@ if __name__ == "__main__":
     assert len(US_FEDERAL_HOLIDAYS_2026) == 11, "expected 11 federal holidays"
     assert date(2026, 11, 26) in US_FEDERAL_HOLIDAYS_2026, "Thanksgiving 2026 = 11/26"
     assert date(2026, 1, 19) in US_FEDERAL_HOLIDAYS_2026, "MLK 2026 = 1/19"
+
+    # --- The holiday count is asserted PER YEAR, not just for 2026 (2026-07-28 fix) ---
+    # The old assertion only covered the constant for the engine's first operating year. A
+    # later year in which two OBSERVED dates collided would silently produce a 10-element
+    # set, and every deadline crossing the missing holiday would come out one business day
+    # early. Named mapping => 11 always; the set is checked for collisions explicitly.
+    for _y in range(2020, 2041):
+        named = federal_holidays_named(_y)
+        assert len(named) == 11, "%d: expected 11 NAMED federal holidays, got %d" % (_y, len(named))
+        observed = _us_federal_holidays(_y)
+        if len(observed) != 11:
+            dupes = sorted(d for d in observed if list(named.values()).count(d) > 1)
+            raise AssertionError(
+                "%d: two federal holidays share an observed date %s — the set collapsed to "
+                "%d entries and a holiday would be silently dropped from the business-day "
+                "count. Fix federal_holidays_named() before shipping this year."
+                % (_y, dupes, len(observed)))
+        assert all(is_business_day(d) is False for d in observed), \
+            "%d: every observed federal holiday must be a non-business day" % _y
+
+    # --- Neighbouring-year spillover: NYD 2022 fell on a Saturday -> observed Fri 2021-12-31 ---
+    assert not is_business_day(date(2021, 12, 31)), \
+        "Fri 2021-12-31 was the observed New Year's Day holiday, not a business day"
+    assert add_business_days(date(2021, 12, 30), 1) == date(2022, 1, 3), \
+        "1 business day after Thu 2021-12-30 must skip the observed 12/31 holiday + weekend"
+
+    # --- Timezone: "today" is the USER'S today, not the UTC container's ---
+    # This is the 2026-07-28 defect: date.today() under UTC is already tomorrow from ~19:00
+    # Central, so a deadline could elapse (and an escalation fire) a full day early.
+    _tz_today = today()
+    _utc_today = datetime.now(timezone.utc).date()
+    assert isinstance(_tz_today, date), "today() must return a date"
+    assert (_utc_today - _tz_today).days in (0, 1), \
+        "profile-timezone today (%s) must be the same day as UTC or one day behind, got %s" \
+        % (_tz_today, _utc_today)
+    assert profile_timezone(), "an operating timezone must always resolve (default %s)" % DEFAULT_TZ
+    # The fallback zone must behave like US Central even with no tz database present.
+    _fb = _USCentral()
+    assert _fb.utcoffset(datetime(2026, 7, 15, 12)) == timedelta(hours=-5), "July = CDT (-5)"
+    assert _fb.utcoffset(datetime(2026, 1, 15, 12)) == timedelta(hours=-6), "January = CST (-6)"
+    # 19:00 Central on 2026-07-27 is 2026-07-28 in UTC — the exact off-by-one-day trap.
+    _evening_utc = datetime(2026, 7, 28, 0, 30, tzinfo=timezone.utc)
+    assert _evening_utc.date() == date(2026, 7, 28), "UTC says the 28th"
+    assert _evening_utc.astimezone(_tzinfo("America/Chicago")).date() == date(2026, 7, 27), \
+        "Central says it is still the 27th — this is the day a deadline would fire early"
 
     print("OK — all businessday.py self-tests passed")
     print("  PPG: 7 business days after Fri 2026-07-17 = %s (calendar +7 would be %s)"
