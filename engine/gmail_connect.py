@@ -57,7 +57,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo"
+#: mail.google.com is NOT belt-and-braces on top of gmail.send — it is the only scope that
+#: makes sending work at all. gmail_transport.send_mime() goes out over Gmail's SMTP MSA
+#: (gmail-smtp-msa.l.google.com:587, STARTTLS, XOAUTH2), and that endpoint refuses gmail.send
+#: and demands full-mailbox access. Without it a token authorises cleanly, reads fine, and can
+#: NEVER send — the failure surfaces as a 535 at AUTH, long after onboarding looked successful.
+#: Reported 2026-07-31 by a recipient who had been carrying it as a local patch.
 SCOPES = [
+    "https://mail.google.com/",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
@@ -94,6 +101,22 @@ class ConnectError(RuntimeError):
 
 
 # ------------------------------------------------------------------ client secrets
+
+OAUTH_TIMEOUT_DEFAULT = 300
+OAUTH_TIMEOUT_MIN = 30
+
+
+def _oauth_timeout(env=None):
+    """Seconds to wait at the consent screen. $MER_OAUTH_TIMEOUT overrides; junk never wins."""
+    raw = (env if env is not None else os.environ).get("MER_OAUTH_TIMEOUT")
+    if not raw:
+        return OAUTH_TIMEOUT_DEFAULT
+    try:
+        v = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return OAUTH_TIMEOUT_DEFAULT
+    return max(OAUTH_TIMEOUT_MIN, v)
+
 
 def load_client_secrets(path):
     """Read a Google 'client_secret_*.json' (installed/desktop shape) -> (client_id, secret)."""
@@ -288,7 +311,12 @@ def connect(client_secrets, token_path=None, open_browser=True):
 
     print("\nOpening Google's consent screen in your browser.")
     print("If it does not open, paste this URL yourself:\n\n%s\n" % url)
-    print("Waiting for you to approve… (Ctrl-C to abort)")
+    # 300 s is generous for someone already signed in and miserly for someone who has to create
+    # the Cloud project, add themselves as a test user, and click through an unverified-app
+    # warning — which is most first-timers. Configurable rather than hard-coded.
+    wait_s = _oauth_timeout()
+    print("Waiting for you to approve… (Ctrl-C to abort; %d s, $MER_OAUTH_TIMEOUT to change)"
+          % wait_s)
     if open_browser:
         try:
             webbrowser.open(url)
@@ -297,11 +325,15 @@ def connect(client_secrets, token_path=None, open_browser=True):
 
     t = threading.Thread(target=srv.handle_request, daemon=True)
     t.start()
-    t.join(timeout=300)
+    t.join(timeout=wait_s)
     srv.server_close()
 
     if not got:
-        raise ConnectError("timed out after 5 minutes with no response from the browser.")
+        raise ConnectError(
+            "timed out after %d seconds with no response from the browser.\n"
+            "  If you need longer (creating the Cloud project takes most people more than five\n"
+            "  minutes), set MER_OAUTH_TIMEOUT to a number of seconds and run this again."
+            % wait_s)
     if got.get("error"):
         extra = ("\n  'access_denied' usually means you did not add your own address as a Test\n"
                  "  user on the OAuth consent screen — see --help-setup step 4."

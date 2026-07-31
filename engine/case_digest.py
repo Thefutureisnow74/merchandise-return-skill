@@ -562,43 +562,16 @@ def _raises(fn, exc=Exception):
         return False
 
 
-def email_digest(text, n, to=None):
-    """Send the digest to the OWNER. Never to a vendor — this is the one outbound this module has.
-
-    Routed through mer_send so the send-path gate holds (only mer_send may reach the transport).
-    The idempotency action carries the DATE, so each day is a distinct logical send and a rerun on
-    the same day is correctly suppressed. The mailbox guard is disabled for this one path on
-    purpose: it exists to stop a second letter reaching a VENDOR, and every prior digest was sent
-    to the owner's own address, so it would block the daily report by design.
-    """
-    import mer_send
-    import mer_config
-    to = to or (mer_config.profile() or {}).get("email")
-    if not to:
-        return {"sent": False, "reason": "no owner email in the profile — refusing to guess"}
-    day = _now().strftime("%Y-%m-%d")
-    return mer_send.send(
-        to, "Case digest %s — %d item(s) need attention" % (day, n), text,
-        case="DIGEST", action="daily_digest_%s" % day, override=True)
-
-
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="cross-runtime status digest (read-only to vendors)")
+    ap = argparse.ArgumentParser(description="cross-runtime status digest (read-only)")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--markdown", action="store_true")
-    ap.add_argument("--email", action="store_true",
-                    help="also email the digest to the profile owner (never to a vendor)")
     a = ap.parse_args(argv)
     if a.selftest:
         return 0 if _selftest() else 1
     rows = gather()
     text, n = render(rows, markdown=a.markdown)
     print(text)
-    if a.email:
-        r = email_digest(text, n)
-        print("")
-        print("-- email: %s"
-              % ("sent to the owner" if r.get("sent") else r.get("reason")))
     return 0
 
 

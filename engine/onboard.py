@@ -253,7 +253,8 @@ class OnboardError(Exception):
 PROFILE_KEYS = ("legal_name", "email", "phone", "mailing_address", "state", "county",
                 "multica_workspace_id", "multica_project_id", "notify", "signature_block",
                 "calendar_id", "google_token_file", "llm_providers")
-PROVISION_KEYS = ("workspace_name", "workspace_slug", "issue_prefix", "project_title",
+PROVISION_KEYS = ("workspace_mode", "workspace_name", "workspace_slug", "issue_prefix",
+                  "project_title",
                   "project_description", "telegram_chat_id", "notify_channel")
 
 REQUIRED_ANSWERS = ("legal_name", "email", "state", "county")
@@ -266,6 +267,10 @@ QUESTIONS = [
     ("mailing_address", "Your mailing address, one line (used on statutory demand letters)", False),
     ("state", "Your STATE of residence, full name (e.g. Ohio). NEVER defaulted", True),
     ("county", "Your COUNTY of residence, without the word 'County'. NEVER defaulted", True),
+    ("workspace_mode", "A NEW Multica workspace for your cases, or ADOPT one you already have?\n"
+                       "  Type 'new' or 'existing'. This is the one irreversible answer here:\n"
+                       "  adopting files your return cases into a board that already exists, and\n"
+                       "  the workspace slug can never be changed afterwards", False),
     ("workspace_name", "Multica workspace name for your cases", False),
     ("workspace_slug", "Multica workspace slug (lowercase-with-hyphens, PERMANENT)", False),
     ("project_title", "Project title inside that workspace", False),
@@ -400,13 +405,52 @@ def step_verify(api, report):
 
 
 def step_workspace(api, answers, report, live):
-    """Step 2 — adopt the workspace if it exists (by id, slug, then name), else create it."""
+    """Step 2 — CREATE or ADOPT the workspace, whichever the answers said. Never guesses.
+
+    This used to decide by itself: match on id, then slug, then case-insensitive name, and
+    adopt whatever came back. Nothing asked, nothing said. A user who typed a workspace name
+    that happened to collide with a board they already had — or with a board a shared machine
+    had already provisioned — got their return cases filed into it with no warning, and
+    workspace_slug cannot be changed afterwards. Reported 2026-07-31.
+
+    So: an exact id (--workspace / multica_workspace_id) is consent and adopts. Otherwise
+    workspace_mode decides, and a mismatch between what was asked for and what is on the
+    server stops rather than picking a side.
+    """
     name = str(answers.get("workspace_name") or DEFAULT_WORKSPACE_NAME).strip()
     slug = str(answers.get("workspace_slug") or DEFAULT_WORKSPACE_SLUG).strip().lower()
     prefix = str(answers.get("issue_prefix") or DEFAULT_ISSUE_PREFIX).strip().upper()
     want_id = str(answers.get("multica_workspace_id") or "").strip() or None
+    mode = str(answers.get("workspace_mode") or "").strip().lower()
+    if mode in ("adopt", "existing", "e"):
+        mode = "existing"
+    elif mode in ("new", "create", "n"):
+        mode = "new"
+    elif mode:
+        raise OnboardError("workspace_mode is %r; it must be 'new' or 'existing'." % mode)
 
     found = api.find_workspace(name=name, slug=slug, ws_id=want_id)
+
+    if want_id and found and found.get("id") == want_id:
+        pass                        # naming the id IS the confirmation — adopt it.
+    elif found and mode != "existing":
+        raise OnboardError(
+            "a workspace already matches what you asked for, and you did not say to adopt it:\n"
+            "    name=%r  slug=%r  ->  existing id=%s slug=%s\n"
+            "  Nothing has been written. Choose one, deliberately:\n"
+            "    * ADOPT it   — re-run with workspace_mode='existing', or --workspace %s\n"
+            "      Your return cases will be filed into that board, alongside whatever is\n"
+            "      already there.\n"
+            "    * KEEP IT SEPARATE — re-run with a different workspace_name AND a different\n"
+            "      workspace_slug. The slug is permanent, so pick it now rather than later."
+            % (name, slug, found.get("id"), found.get("slug"), found.get("id")))
+    elif not found and mode == "existing":
+        raise OnboardError(
+            "workspace_mode='existing' says adopt a workspace you already have, but nothing on\n"
+            "  this account matches name=%r or slug=%r. Nothing has been written.\n"
+            "  Either pass the exact id with --workspace <id>, or re-run with\n"
+            "  workspace_mode='new' to create it." % (name, slug))
+
     if found:
         report.add("workspace", name, ADOPTED, "id=%s slug=%s" % (found.get("id"), found.get("slug")))
         return found
@@ -823,8 +867,11 @@ def _selftest():
               for n in TIER4_GATE_PROPS), ", ".join(TIER4_GATE_PROPS))
 
     # 2. RE-RUN on the same board: pure adopt, ZERO creates. This is idempotency.
+    #    A re-run now has to SAY it is adopting — silence used to mean "adopt whatever matched",
+    #    which is the bug this section's refusal checks are about.
     creates_before = [c for c in board.calls if c.startswith("create_")]
-    (rep2, prof2), _ = _quiet(run, board, dict(_ANSWERS), True, os.path.join(tmp, "second.json"))
+    _rerun = dict(_ANSWERS, workspace_mode="existing")
+    (rep2, prof2), _ = _quiet(run, board, _rerun, True, os.path.join(tmp, "second.json"))
     creates_after = [c for c in board.calls if c.startswith("create_")]
     c2 = rep2.counts()
     check("re-run creates NOTHING (idempotent)", creates_before == creates_after,
@@ -838,6 +885,40 @@ def _selftest():
           % (len(board_created), c2.get(ADOPTED, 0)))
     check("re-run resolves the same workspace id", prof2["multica_workspace_id"] == prof["multica_workspace_id"])
 
+    # 2b. THE SILENT-ADOPT REFUSALS. onboard.py used to match id -> slug -> case-insensitive
+    #     name and adopt whatever it found, without asking and without saying so. A name that
+    #     collided with a board the user already had — or that a shared machine had already
+    #     provisioned — swallowed their return cases, and workspace_slug is permanent.
+    def _refuses(label, answers, needle):
+        try:
+            _quiet(run, board, answers, True, os.path.join(tmp, "refuse-%s.json" % label))
+        except OnboardError as e:
+            check("refuses to %s" % label, needle in str(e), str(e).splitlines()[0])
+            return
+        check("refuses to %s" % label, False, "it went ahead")
+
+    _refuses("adopt a matching workspace when the answers never said to",
+             dict(_ANSWERS), "you did not say to adopt it")
+    _refuses("adopt a matching workspace when the user asked for a NEW one",
+             dict(_ANSWERS, workspace_mode="new"), "you did not say to adopt it")
+    _refuses("invent a workspace the user said already existed",
+             dict(_ANSWERS, workspace_mode="existing", workspace_name="Nothing Like This",
+                  workspace_slug="nothing-like-this"), "nothing on")
+    _refuses("accept a workspace_mode that is neither",
+             dict(_ANSWERS, workspace_mode="maybe"), "must be 'new' or 'existing'")
+
+    creates_after_refusals = [c for c in board.calls if c.startswith("create_")]
+    check("every refusal wrote NOTHING to the board",
+          creates_after_refusals == creates_after,
+          "%d creates before the refusals, %d after"
+          % (len(creates_after), len(creates_after_refusals)))
+
+    # An exact id is consent in itself — the user cannot have typed it by accident.
+    (rep2b, _p), _ = _quiet(run, board, dict(_ANSWERS, multica_workspace_id=prof["multica_workspace_id"]),
+                            True, os.path.join(tmp, "byid.json"))
+    check("naming the workspace id adopts it without workspace_mode",
+          rep2b.actions_for("workspace").get("Merchandise Return") == ADOPTED)
+
     # 3. THE PARTIAL BOARD: everything except the two Tier-4 gate properties already
     #    exists. Adopt all of those, create exactly the two missing ones. The counts are
     #    derived from MR_SCHEMA, never hardcoded — M44 added `MR Remedy Type` and a literal
@@ -849,7 +930,8 @@ def _selftest():
                                        for j, o in enumerate(s.get("options") or [])]}}
                for i, s in enumerate(MR_SCHEMA) if s["name"] not in TIER4_GATE_PROPS]
     king = _StubBoard(workspaces=[ws], projects={"ws-king": []}, properties={"ws-king": partial})
-    (rep3, prof3), _ = _quiet(run, king, dict(_ANSWERS), True, os.path.join(tmp, "king.json"))
+    (rep3, prof3), _ = _quiet(run, king, dict(_ANSWERS, workspace_mode="existing"), True,
+                              os.path.join(tmp, "king.json"))
     p3 = rep3.actions_for("property")
     check("partial board adopts the workspace", rep3.actions_for("workspace").get("Merchandise Return") == ADOPTED)
     n_pre_existing = len(MR_SCHEMA) - len(TIER4_GATE_PROPS)
@@ -896,7 +978,8 @@ def _selftest():
     clash = _StubBoard(workspaces=[ws], projects={"ws-king": []},
                        properties={"ws-king": [{"id": "x", "name": "MR Phase", "type": "text", "config": {}}]})
     try:
-        _quiet(run, clash, dict(_ANSWERS), True, os.path.join(tmp, "clash.json"))
+        _quiet(run, clash, dict(_ANSWERS, workspace_mode="existing"), True,
+               os.path.join(tmp, "clash.json"))
         check("wrong property TYPE aborts the run", False, "no exception raised")
     except OnboardError as e:
         check("wrong property TYPE aborts the run", "IMMUTABLE" in str(e))
@@ -906,7 +989,8 @@ def _selftest():
     thin[0] = {"id": "p0", "name": "MR Phase", "type": "select",
                "config": {"options": [{"id": "o0", "name": "Intake"}]}}
     warnboard = _StubBoard(workspaces=[ws], projects={"ws-king": []}, properties={"ws-king": thin})
-    (rep8, _p8), _ = _quiet(run, warnboard, dict(_ANSWERS), True, os.path.join(tmp, "warn.json"))
+    (rep8, _p8), _ = _quiet(run, warnboard, dict(_ANSWERS, workspace_mode="existing"), True,
+                            os.path.join(tmp, "warn.json"))
     check("an MR Phase missing Tier4 raises a warning", any("Tier4" in w for w in rep8.warnings),
           "%d warning(s)" % len(rep8.warnings))
 

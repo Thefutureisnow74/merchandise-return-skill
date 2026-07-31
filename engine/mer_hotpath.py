@@ -737,7 +737,14 @@ def _selftest():
         if lk2:
             lk2.release()
 
-    st_lock = EngineLock(stale=0.0)
+    # stale=-1.0, not 0.0. acquire() reclaims on `age > self.stale`, a strict >, and the lock it
+    # is about to reclaim was stamped microseconds earlier with time.time() — whose granularity
+    # on Windows is ~0.78 ms, so two consecutive calls almost always return the identical float.
+    # age comes out exactly 0.0, the reclaim is refused, the lock stays held, and three later
+    # checks cascade into an uncaught LockBusy that reds the whole module. Green on Linux, red on
+    # Windows, for no production reason at all — the real stale window is 900 s. Reported
+    # 2026-07-31 from a Windows install.
+    st_lock = EngineLock(stale=-1.0)
     # simulate a dead holder: write a lock, then reclaim it because it is stale
     EngineLock().acquire()
     reclaimed = False

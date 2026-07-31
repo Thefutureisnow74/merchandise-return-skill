@@ -282,10 +282,11 @@ def derive_mail_from(intake, explicit=None):
     me = ((intake or {}).get("user_email") or "").strip().lower()
     my_host = me.split("@", 1)[1] if "@" in me else ""
     # Strip the user's OWN HOST only when it is a company domain. If the user is on gmail.com,
-    # dropping every gmail.com address would discard the counterparty too: a case whose vendor
-    # contact is itself a free-mail address (a small trader, an individual seller) is watched by
-    # that exact address, and a blanket host filter would silently delete the only thing watching
-    # it. Real occurrence — the case survived only because this was caught.
+    # dropping every gmail.com address would discard the counterparty too — a case whose
+    # counterparty is on a free host is watched by `from:<their address>`, and a blanket
+    # same-host strip would silently delete exactly that watch. (A real person's address stood
+    # here as the example until 2026-07-31, when the publish gate caught it on its way into a
+    # public package. An example never needs to be a real address.)
     strip_host = my_host if my_host and my_host not in _BROAD_HOSTS else ""
 
     addrs, domains = [], []

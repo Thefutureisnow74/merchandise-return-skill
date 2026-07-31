@@ -215,6 +215,16 @@ class Job(object):
         self.description = str(self.raw.get("description") or "").strip()
         self.schedule_human = str(self.raw.get("schedule_human") or "").strip()
 
+        #: OPERATOR-ONLY. The manifest ships verbatim to every recipient, but a few jobs only
+        #: mean anything where a master tree exists to compare against (drift_gate.py, which
+        #: drift_gate.py itself lists as NOT_SHIPPED). Registering such a job on a recipient's
+        #: box installs a clock line that fails every single time it fires. Flagged jobs are
+        #: therefore skipped — but ONLY when their module is genuinely absent, and only because
+        #: the manifest said so out loud. An unflagged job naming a missing module stays loud
+        #: (§10 E19: a gate that cries wolf is a gate somebody bypasses; a gate that goes quiet
+        #: on its own is worse).
+        self.operator_only = bool(self.raw.get("operator_only"))
+
         self.steps = []
         for i, st in enumerate(self.raw.get("steps") or []):
             if not isinstance(st, dict) or not st.get("module"):
@@ -249,6 +259,14 @@ class Job(object):
             raise SchedulerError("job %r uses stdout.mode='summary' but sets no 'lines'."
                                  % self.name)
         self.stdout = so
+
+    def modules_present(self, cfg):
+        """True when every module this job names is installed next to scheduler.py."""
+        return all(os.path.isfile(cfg.module_path(st["module"])) for st in self.steps)
+
+    def skip_here(self, cfg):
+        """An operator-only job whose module did not ship to this host. Not an error."""
+        return self.operator_only and not self.modules_present(cfg)
 
     def __repr__(self):
         return "<Job %s %r>" % (self.name, self.schedule)
@@ -1164,6 +1182,9 @@ def cmd_list(manifest, cfg, out):
         out.write("%-22s  %-16s  %s\n" % (job.name, job.cron.expr, job.schedule_human))
         if job.description:
             out.write("%-22s  %s\n" % ("", job.description))
+        if job.skip_here(cfg):
+            out.write("%-22s  operator-only: %s is not installed here, so this job is not "
+                      "registered\n" % ("", job.steps[0]["module"]))
     return 0
 
 
@@ -1186,7 +1207,8 @@ def cmd_status(manifest, cfg, backend, out):
             when = datetime.datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
         else:
             when = "(never run)"
-        out.write("%-22s  %-10s  %s\n" % (job.name, "yes" if job.name in have else "no", when))
+        state = "yes" if job.name in have else ("n/a" if job.skip_here(cfg) else "no")
+        out.write("%-22s  %-10s  %s\n" % (job.name, state, when))
     if not have:
         out.write("\nNo jobs are installed. The engine has no clock — run:\n")
         out.write("    %s --install --live\n" % job_command_self(cfg))
@@ -1316,7 +1338,9 @@ def main(argv=None, out=None):
             return 0
 
         backend = backend_for(args.backend)
-        jobs = manifest.jobs
+        # An operator-only job whose module is not on this host is never registered. Naming it
+        # explicitly with --job still installs it, so the operator is never fought by this.
+        jobs = [j for j in manifest.jobs if not j.skip_here(cfg)]
         if args.job:
             jobs = [manifest.get(n) for n in args.job]
 
@@ -1357,10 +1381,26 @@ def selftest(out=None):
               os.path.basename(m.source) in MANIFEST_SEARCH_NAMES, m.source)
         check("shipped manifest defines jobs", len(m.jobs) >= 6, "%d jobs" % len(m.jobs))
         cfg0 = Config(scripts_dir=HERE)
-        missing = [st["module"] for j in m.jobs for st in j.steps
+        missing = [st["module"] for j in m.jobs if not j.operator_only for st in j.steps
                    if not os.path.isfile(cfg0.module_path(st["module"]))]
         check("every module named by the manifest exists next to scheduler.py",
               not missing, "missing: %s" % sorted(set(missing)))
+        # The exemption is narrow on purpose: a job may only go quiet about a missing module if
+        # the manifest declared it operator-only. Found on a recipient's install, where the
+        # shipped manifest named drift_gate.py — an operator tool that deliberately does not
+        # ship — and took the whole self-test red on a package that was otherwise correct.
+        _absent = Config(scripts_dir=os.path.join(HERE, "__no_such_dir__"))
+        _op = Job({"name": "op", "schedule": "0 9 * * *", "operator_only": True,
+                   "steps": [{"module": "gone.py"}]})
+        _norm = Job({"name": "norm", "schedule": "0 9 * * *",
+                     "steps": [{"module": "gone.py"}]})
+        check("an operator-only job with no module installed is skipped on this host",
+              _op.skip_here(_absent))
+        check("an ordinary job with no module installed is NEVER skipped",
+              not _norm.skip_here(_absent))
+        check("an operator-only job whose module IS present still runs",
+              not Job({"name": "op2", "schedule": "0 9 * * *", "operator_only": True,
+                       "steps": [{"module": "scheduler.py"}]}).skip_here(cfg0))
         check("every job has a bounded log target",
               all(j.log for j in m.jobs))
 

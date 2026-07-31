@@ -104,8 +104,8 @@
     },
     {
       "name": "mer-digest",
-      "schedule": "5 20 * * *",
-      "schedule_human": "daily 20:05 UTC = 15:05 CT (CDT) — the 3PM audit the user asked for; 14:05 CT under CST, the unavoidable fixed-UTC DST drift",
+      "schedule": "0 13 * * *",
+      "schedule_human": "daily 13:00 UTC = 08:00 CT (CDT), at the start of the working day",
       "description": "Cross-runtime status digest: every case, every unanswered reply, every send by ANY actor.",
       "why_on_a_clock": [
         "M50. The board says what the state is. A local ledger says what THIS runtime did. Neither",
@@ -122,17 +122,7 @@
         "outbound from `in:sent`, not from a ledger. That is what makes another runtime's work",
         "visible instead of looking like neglect.",
         "",
-        "STRICTLY READ-ONLY: it never writes to the board, never sends, never touches the ledger.",
-        "",
-        "2026-07-30: moved to 15:05 UTC-5 and given --email. The user asked for one daily scan",
-        "at 3PM rather than an every-minute poller, on the grounds that vendors reply on",
-        "business timescales and the fast loop was producing noise rather than speed. He was",
-        "right: the every-minute path caught a reply in 60 seconds and drafted a WORSE letter",
-        "than a considered one, and two runtimes both awake is what put three copies of one",
-        "letter in a store manager's inbox.",
-        "",
-        "--email matters as much as the schedule. A digest written to a log on a host nobody",
-        "reads is the same failure as the skip lines that hid an unwatched case for a day."
+        "STRICTLY READ-ONLY: it never writes to the board, never sends, never touches the ledger."
       ],
       "env_from_file": [
         "MULTICA_TOKEN",
@@ -143,9 +133,7 @@
       "steps": [
         {
           "module": "case_digest.py",
-          "args": [
-            "--email"
-          ],
+          "args": [],
           "output": "log"
         }
       ],
@@ -500,6 +488,17 @@
       "schedule": "20 14 * * *",
       "schedule_human": "daily 14:20 UTC = 09:20 CT (CDT), after the coverage audit",
       "description": "Fails if any deployed skill tree diverges from the master, or holds a secret.",
+      "operator_only": true,
+      "operator_only_why": [
+        "drift_gate.py compares deployed trees against the MASTER, so it only means anything on",
+        "the machine that holds the master — its own NOT_SHIPPED list excludes it from the",
+        "package. But this manifest ships verbatim, so every recipient was registering a clock",
+        "line for a module they do not have: a job that fails every time it fires, and a red",
+        "scheduler --selftest on an otherwise correct install. Reported 2026-07-31 from a",
+        "recipient's box. scheduler.py skips a flagged job only when its module is genuinely",
+        "absent; here, where drift_gate.py exists, it runs exactly as before."
+      ],
+
       "why_on_a_clock": [
         "M51. SKILL.md sec 7 has always said: edit the master only, never a copy, because divergence",
         "between copies is the original sin that split this skill's two predecessors apart. It",

@@ -295,7 +295,7 @@ def _selftest():
     check("placeholder text reads as absent",
           _val({"serial": "N/A - subscription service"}, "serial") == ""
           and _val({"serial": "not provided"}, "serial") == ""
-          and _val({"serial": "X99Z00Y111222333"}, "serial") == "X99Z00Y111222333")
+          and _val({"serial": "SN0000TEST12345"}, "serial") == "SN0000TEST12345")
     check("the nullish pattern carries no corrupted escapes",
           chr(8) not in _NULLISH.pattern,
           "a non-raw patch turned \b into a literal backspace and the regex matched nothing")
@@ -314,8 +314,8 @@ def _selftest():
     check("brief names the actual product", "Acme widget" in b and "S-1" in b)
 
     check("_from_block pulls a value",
-          _from_block("  2.2 Serial number / IMEI / VIN: X99Z00Y111222333\n",
-                      "2.2 Serial number") == "X99Z00Y111222333")
+          _from_block("  2.2 Serial number / IMEI / VIN: SN0000TEST12345\n",
+                      "2.2 Serial number") == "SN0000TEST12345")
     check("_from_block on a missing label returns empty",
           _from_block("nothing here", "2.2 Serial number") == "")
 

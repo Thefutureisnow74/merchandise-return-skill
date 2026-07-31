@@ -273,7 +273,7 @@ SOUL.md edits (identity / standing instructions):
        and keeps the conversation. Good when the edit isn't urgent.
    (b) FORCE NOW, fleet-wide, non-destructive -- restart the gateway:
          In any session:  /restart
-         or on the host:  ssh <your-vps> 'docker restart <container>'
+         or on the host:  ssh hermes-vps 'docker restart <container>'
        Drains in-flight turns; conversations persist in session_db and resume.
    (c) AVOID for refresh: /new and /reset REBUILD the SOUL but WIPE the
        conversation. Only use if you also want a fresh conversation.
