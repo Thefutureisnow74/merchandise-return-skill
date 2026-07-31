@@ -247,26 +247,31 @@ def local_module_names(scripts_dir):
 
 
 def scheduled_modules(scripts_dir):
-    """Modules the CLOCK reaches: schedule.json[.example] job steps + *_cron.sh wrappers.
+    """Modules the CLOCK reaches: schedule.json job steps + *_cron.sh wrappers.
 
     Returns {module_name: "how"} so the failure report can say what evidence was looked for.
+
+    ONE manifest name, matching scheduler.MANIFEST_SEARCH_NAMES. This used to search
+    ("schedule.json", "schedule.json.example") and break on the first hit — the same
+    shadowing mechanism the scheduler had, and it MUST stay identical to it. If this gate
+    reads a different manifest than the clock executes, the gate is asserting things about
+    a file nothing runs, which is worse than having no gate at all.
     """
     found = {}
-    for manifest in ("schedule.json", "schedule.json.example"):
-        p = os.path.join(scripts_dir, manifest)
-        if not os.path.exists(p):
-            continue
+    manifest = "schedule.json"
+    p = os.path.join(scripts_dir, manifest)
+    if os.path.exists(p):
         try:
             with open(p, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except (ValueError, OSError):
-            continue
-        for job in data.get("jobs", []):
-            for step in job.get("steps", []):
-                mod = str(step.get("module", ""))
-                if mod.endswith(".py"):
-                    found.setdefault(mod[:-3], "%s job %r" % (manifest, job.get("name")))
-        break   # a real schedule.json wins over the example; never merge the two
+            data = None
+        if data:
+            for job in data.get("jobs", []):
+                for step in job.get("steps", []):
+                    mod = str(step.get("module", ""))
+                    if mod.endswith(".py"):
+                        found.setdefault(mod[:-3], "%s job %r" % (manifest, job.get("name")))
 
     for fname in sorted(os.listdir(scripts_dir)):
         if not fname.endswith("_cron.sh"):
@@ -607,7 +612,7 @@ def _selftest():
             fh.write("VALUE = 1\n")
         with open(os.path.join(sandbox, "user.py"), "w", encoding="utf-8") as fh:
             fh.write("import leaf\nprint(leaf.VALUE)\n")
-        with open(os.path.join(sandbox, "schedule.json.example"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(sandbox, "schedule.json"), "w", encoding="utf-8") as fh:
             json.dump({"jobs": [{"name": "j", "steps": [{"module": "user.py"}]}]}, fh)
 
         buf = io.StringIO()

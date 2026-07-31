@@ -19,9 +19,7 @@
     "name, no log directory, no user identity. Those come from scheduler config (see 'config' in",
     "scheduler.py --help). This file describes the WORK; config describes the MACHINE."
   ],
-
   "version": 1,
-
   "defaults": {
     "log_max_lines": 5000,
     "schedule_timezone": "UTC",
@@ -66,10 +64,96 @@
       "every FAILURE is appended to an UNBOUNDED error log (heartbeat.py's `mer_errors.log`,",
       "beside the heartbeat file) that nothing ever truncates. Bounded logs are for reading;",
       "the error log is for evidence."
-    ]
+    ],
+    "_send_mode_note": "MER_ENGINE_SEND IS DELIBERATELY NOT IN THIS FILE. It is read from the host environment only -- the *_cron.sh wrappers export it from the operator's .env. When it is unset, mer_send.mode() returns 'off': every reply is still drafted and queued, and nothing is sent. A fresh install therefore cannot mail a vendor until a human turns sending on, which is the safe default. It lived here until 2026-07-29 with the value 'test', and because the operator's box needed 'live', somebody copied this manifest to schedule.json and edited it -- creating a second, untracked manifest that shadowed the real one and silently defeated three separate timezone fixes. Keeping host-specific values out of the manifest is what stops that recurring: see design rule 3 at the top of scheduler.py."
   },
-
   "jobs": [
+    {
+      "name": "mer-stop-list-check",
+      "schedule": "5 13 * * *",
+      "schedule_human": "daily 13:05 UTC, right after the digest",
+      "description": "Prints the do-not-contact register so a withdrawn instruction stays visible.",
+      "why_on_a_clock": [
+        "M49. A user withdrew contact with a party mid-session; the instruction lived in a comment",
+        "and in one session's memory, and sessions are stateless. reserve_send() now refuses a",
+        "blocked recipient structurally, so the block is enforced whether or not anyone remembers.",
+        "",
+        "This job exists so the register does not become invisible furniture. A stop nobody can see",
+        "is a stop somebody will eventually argue with, and a stale block silently prevents a send",
+        "that has since become legitimate. Printing it daily keeps it reviewable.",
+        "",
+        "Read-only."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID"
+      ],
+      "log": "mer_stop_list.log",
+      "steps": [
+        {
+          "module": "stop_list.py",
+          "args": [
+            "--list"
+          ],
+          "output": "log"
+        }
+      ],
+      "stdout": {
+        "mode": "silent"
+      }
+    },
+    {
+      "name": "mer-digest",
+      "schedule": "5 20 * * *",
+      "schedule_human": "daily 20:05 UTC = 15:05 CT (CDT) — the 3PM audit the user asked for; 14:05 CT under CST, the unavoidable fixed-UTC DST drift",
+      "description": "Cross-runtime status digest: every case, every unanswered reply, every send by ANY actor.",
+      "why_on_a_clock": [
+        "M50. The board says what the state is. A local ledger says what THIS runtime did. Neither",
+        "answers the question that matters: what has happened on my cases, by anyone, and what is",
+        "waiting on me?",
+        "",
+        "Three failures on one day were all this same blindness. Two vendor replies sat ~27 hours",
+        "unanswered and were found only because a session ran an ad-hoc mailbox search while working",
+        "an unrelated case. A session then reported a case as neglected when another runtime had",
+        "answered it inside 90 minutes. And a store manager received three copies of one letter,",
+        "because two runtimes each knew only their own sends.",
+        "",
+        "So this reads the two sources every actor shares - the board and the MAILBOX - and reports",
+        "outbound from `in:sent`, not from a ledger. That is what makes another runtime's work",
+        "visible instead of looking like neglect.",
+        "",
+        "STRICTLY READ-ONLY: it never writes to the board, never sends, never touches the ledger.",
+        "",
+        "2026-07-30: moved to 15:05 UTC-5 and given --email. The user asked for one daily scan",
+        "at 3PM rather than an every-minute poller, on the grounds that vendors reply on",
+        "business timescales and the fast loop was producing noise rather than speed. He was",
+        "right: the every-minute path caught a reply in 60 seconds and drafted a WORSE letter",
+        "than a considered one, and two runtimes both awake is what put three copies of one",
+        "letter in a store manager's inbox.",
+        "",
+        "--email matters as much as the schedule. A digest written to a log on a host nobody",
+        "reads is the same failure as the skip lines that hid an unwatched case for a day."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL"
+      ],
+      "log": "mer_digest.log",
+      "steps": [
+        {
+          "module": "case_digest.py",
+          "args": [
+            "--email"
+          ],
+          "output": "log"
+        }
+      ],
+      "stdout": {
+        "mode": "summary",
+        "lines": 12
+      }
+    },
     {
       "name": "mer-engine",
       "schedule": "0 13-22 * * 1-5",
@@ -98,21 +182,28 @@
         "MINIMAX_API_KEY"
       ],
       "env": {
-        "MER_ENGINE_SEND": "test",
         "MER_ENGINE_WINDOW_HOURS": "3"
       },
       "env_notes": [
-        "MER_ENGINE_SEND ships as 'test' ON PURPOSE. In test mode every drafted reply is redirected",
-        "to your own mailbox instead of the vendor's, so a fresh install cannot send a stranger's",
-        "vendor a machine-written letter on day one. Watch the drafts for a week; when you trust",
-        "them, change this to 'live'. 'off' drafts nothing at all.",
-        "MER_ENGINE_WINDOW_HOURS is the veto window: how long a queued send sits before it goes out.",
-        "Cancel one with: send_queue.py --veto <id>."
+        "MER_ENGINE_SEND IS NOT SET HERE, on purpose -- see defaults._send_mode_note. It comes from the host environment (the *_cron.sh wrappers export it from the operator's .env). Unset means 'off': replies are still drafted and queued, and nothing leaves. Turning sending on is a deliberate act by a human on one box, not a value shipped to everyone.",
+        "MER_ENGINE_WINDOW_HOURS is the veto window: hours between a reply being drafted and it actually going out. It stays in the manifest because it is a behavioural default that is right for every install, not a property of one machine."
       ],
       "log": "mer_engine.log",
       "steps": [
-        { "module": "mer_hotpath.py", "args": ["--force"], "output": "log" },
-        { "module": "send_queue.py", "args": ["--process"], "output": "log" }
+        {
+          "module": "mer_hotpath.py",
+          "args": [
+            "--force"
+          ],
+          "output": "log"
+        },
+        {
+          "module": "send_queue.py",
+          "args": [
+            "--process"
+          ],
+          "output": "log"
+        }
       ],
       "step_notes": [
         "The first step runs mer_engine via mer_hotpath --force rather than calling mer_engine.py",
@@ -130,9 +221,10 @@
         "the step here as well is deliberate redundancy: if the frequent drain job is ever removed,",
         "the queue still drains rather than silently filling up forever."
       ],
-      "stdout": { "mode": "silent" }
+      "stdout": {
+        "mode": "silent"
+      }
     },
-
     {
       "name": "mer-send-queue",
       "schedule": "*/10 13-22 * * *",
@@ -168,19 +260,32 @@
         "MER_SENDER"
       ],
       "env": {
-        "MER_ENGINE_SEND": "test",
         "MER_ENGINE_WINDOW_HOURS": "3"
       },
       "env_notes": [
-        "MER_ENGINE_SEND must match the mer-engine job. This job does not decide whether to send;",
-        "it decides whether a letter that was ALREADY approved for sending has finished waiting."
+        "This job does not decide WHETHER to send -- it drains letters whose veto window has already closed. It inherits send mode from the host environment exactly as mer-engine does, so the two cannot disagree: there is no longer a manifest value for them to disagree about."
       ],
       "log": "send_queue.log",
       "steps": [
-        { "module": "send_queue.py", "args": ["--process"], "output": "alert" },
-        { "module": "heartbeat.py",
-          "args": ["--beat", "mer-send-queue", "--expect", "1800", "--detail", "queue drained"],
-          "output": "log" }
+        {
+          "module": "send_queue.py",
+          "args": [
+            "--process"
+          ],
+          "output": "alert"
+        },
+        {
+          "module": "heartbeat.py",
+          "args": [
+            "--beat",
+            "mer-send-queue",
+            "--expect",
+            "1800",
+            "--detail",
+            "queue drained"
+          ],
+          "output": "log"
+        }
       ],
       "step_notes": [
         "The heartbeat step proves THE JOB RAN, not that the drain succeeded -- the scheduler runs",
@@ -195,7 +300,6 @@
         "fail_message": "send_queue --process exited {rc} - the veto queue did not drain, so approved letters are sitting unsent while their deadlines run."
       }
     },
-
     {
       "name": "mer-hotpath",
       "schedule": "* * * * *",
@@ -219,27 +323,18 @@
         "MINIMAX_API_KEY"
       ],
       "env": {
-        "MER_ENGINE_SEND": "test",
         "MER_ENGINE_WINDOW_HOURS": "3"
       },
       "env_notes": [
-        "MER_ENGINE_SEND must match the mer-engine job -- this dispatches that same module and",
-        "deliberately never sets the send gate itself.",
-        "MER_HOTPATH_MIN_INTERVAL / MAX_INTERVAL / BACKOFF only affect --run-forever, not this job.",
-        "On a host with no minute-granularity cron, drop this job and run",
-        "'mer_hotpath.py --run-forever' under a supervisor instead.",
-        "",
-        "env_from_file IS LOAD-BEARING AND WAS THE 2026-07-28 OUTAGE. The dispatched mer_engine",
-        "child inherits this job's environment; without MULTICA_TOKEN in it, every dispatch died",
-        "with 'GET /properties -> 401: missing authorization' while the minute loop itself kept",
-        "reporting rc=0 and 'idle - no mailbox change' 1439 times a day. If your scheduler config",
-        "does not set an env file (scheduler.py's --env-file / MER_SCHED_ENV_FILE), these keys",
-        "resolve to nothing. mer_hotpath.py now also reads the shared .env itself as a belt-and-",
-        "braces measure (MER_ENV_FILE, default <data dir>/.env) -- but SET THE ENV FILE ANYWAY."
+        "This dispatches the same module as mer-engine and therefore obeys the same host MER_ENGINE_SEND. It is structurally forbidden from draining the send queue (FORBIDDEN_DISPATCH in mer_hotpath.py): it detects and dispatches, it never sends."
       ],
       "log": "mer_hotpath.log",
       "steps": [
-        { "module": "mer_hotpath.py", "args": [], "output": "log" }
+        {
+          "module": "mer_hotpath.py",
+          "args": [],
+          "output": "log"
+        }
       ],
       "step_notes": [
         "mer_hotpath writes its own heartbeat on every tick -- idle, dispatching, or crashing --",
@@ -247,9 +342,10 @@
         "cursor, so the mail that triggered the failure is retried on the next tick instead of",
         "being skipped forever."
       ],
-      "stdout": { "mode": "silent" }
+      "stdout": {
+        "mode": "silent"
+      }
     },
-
     {
       "name": "mer-heartbeat",
       "schedule": "*/10 * * * *",
@@ -280,7 +376,9 @@
         "and this checker ignores them outside it -- otherwise it would report the engine missing",
         "every night and be muted within a week."
       ],
-      "env_from_file": ["MER_PROFILE"],
+      "env_from_file": [
+        "MER_PROFILE"
+      ],
       "env": {},
       "env_notes": [
         "The Telegram bot token is read from the shared secrets file by the alerter itself and is",
@@ -288,7 +386,13 @@
       ],
       "log": "heartbeat.log",
       "steps": [
-        { "module": "heartbeat.py", "args": ["--check"], "output": "alert" }
+        {
+          "module": "heartbeat.py",
+          "args": [
+            "--check"
+          ],
+          "output": "alert"
+        }
       ],
       "stdout": {
         "mode": "alert",
@@ -297,7 +401,6 @@
         "fail_message": "heartbeat --check exited {rc} - THE HEALTH CHECKER ITSELF IS BROKEN. Nothing is watching the engine until this is fixed."
       }
     },
-
     {
       "name": "mer-case-tick",
       "schedule": "0 14 * * *",
@@ -316,13 +419,29 @@
         "MINIMAX_API_KEY"
       ],
       "env": {
-        "MER_ENGINE_SEND": "test",
         "MER_ENGINE_WINDOW_HOURS": "3"
       },
       "log": "case_tick.log",
       "steps": [
-        { "module": "case_tick.py", "args": ["--live"], "output": "log+match" },
-        { "module": "heartbeat.py", "args": ["--beat", "mer-case-tick", "--expect", "108000", "--detail", "daily tick ran"], "output": "log" }
+        {
+          "module": "case_tick.py",
+          "args": [
+            "--live"
+          ],
+          "output": "log+match"
+        },
+        {
+          "module": "heartbeat.py",
+          "args": [
+            "--beat",
+            "mer-case-tick",
+            "--expect",
+            "108000",
+            "--detail",
+            "daily tick ran"
+          ],
+          "output": "log"
+        }
       ],
       "step_notes": [
         "The heartbeat step proves the daily tick RAN. Without it, a case-tick that silently stopped",
@@ -336,7 +455,123 @@
         "footer": "(full board: your Multica workspace)"
       }
     },
-
+    {
+      "name": "mer-coverage-audit",
+      "schedule": "15 14 * * *",
+      "schedule_human": "daily 14:15 UTC = 09:15 CT (CDT), just after mer-case-tick",
+      "description": "Fails if ANY live case has no derivable Gmail watch scope.",
+      "why_on_a_clock": [
+        "M47. case_queries already refuses to guess a query it cannot derive safely, and logs",
+        "each skip. Logging is not telling. A case has gone dark from the moment it was created",
+        "- no MAIL FROM block, no CONTACTS address - and nobody learned of it for a day. Every",
+        "other case had a query; the newest one did not, and demand letters went out on it into",
+        "a mailbox with nothing watching for the reply.",
+        "",
+        "new_case.py now writes a MAIL FROM block at creation, which stops NEW cases going dark.",
+        "This job is the backstop for the other ways it happens: a description edited on the",
+        "board, a vendor that starts replying from a domain nobody listed, a case imported by",
+        "hand, or a guessed domain that was simply wrong. It exits NON-ZERO, so an unwatched",
+        "case becomes a failing job - the one signal that reliably escalates - instead of a line",
+        "in a log file.",
+        "",
+        "Read-only: it resolves queries and prints. It never writes to the board, never sends."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL"
+      ],
+      "log": "mer_coverage_audit.log",
+      "steps": [
+        {
+          "module": "case_queries.py",
+          "args": [
+            "--audit"
+          ],
+          "output": "log"
+        }
+      ],
+      "stdout": {
+        "mode": "alert"
+      }
+    },
+    {
+      "name": "mer-drift-gate",
+      "schedule": "20 14 * * *",
+      "schedule_human": "daily 14:20 UTC = 09:20 CT (CDT), after the coverage audit",
+      "description": "Fails if any deployed skill tree diverges from the master, or holds a secret.",
+      "why_on_a_clock": [
+        "M51. SKILL.md sec 7 has always said: edit the master only, never a copy, because divergence",
+        "between copies is the original sin that split this skill's two predecessors apart. It",
+        "happened again anyway and nobody knew. One deployed tree was four milestones stale AND",
+        "carried two modules that existed nowhere else - one of which promoted cases to auto-send",
+        "with no veto window, the other of which called the raw mail transport directly, bypassing",
+        "the send token, the mailbox guard and the do-not-contact register. Neither had been",
+        "reviewed, because neither was ever in the master to review.",
+        "",
+        "It was found by running a diff by hand while checking something unrelated - the same way",
+        "the three preceding incidents were found. A rule that depends on somebody thinking to look",
+        "is not enforcement.",
+        "",
+        "It also checks for credentials in a distributable tree: a live OAuth refresh token was",
+        "found inside the engine folder of a skill whose documented model is 'hand the folder to",
+        "anyone'. Read-only; it reports and exits non-zero, it never copies or deletes."
+      ],
+      "log": "mer_drift_gate.log",
+      "steps": [
+        {
+          "module": "drift_gate.py",
+          "args": [],
+          "output": "log"
+        }
+      ],
+      "stdout": {
+        "mode": "alert"
+      }
+    },
+    {
+      "name": "mer-recall-sweep",
+      "schedule": "25 14 * * *",
+      "schedule_human": "daily 14:25 UTC = 09:25 CT (CDT), after the coverage audit and drift gate",
+      "description": "Fails if any product case has not had its recall check run.",
+      "why_on_a_clock": [
+        "M54. The recall check is the most valuable single lever in the ladder and the one nobody",
+        "thinks to pull. The first time it was actually run it found a CPSC recall with an exact model",
+        "match on a $3,000 chair, whose mandated remedy included a FULL REFUND - on a case that had",
+        "already been through Tier 1 and Tier 2 with nobody looking.",
+        "",
+        "It also found the reason it matters most: a recall remedy is keyed to MODEL AND SERIAL, not to",
+        "proof of purchase. That is the exact wall a lost-receipt case hits, and two live cases were",
+        "stuck against it.",
+        "",
+        "M53 made recall_check a blocking lever in the remedy map, which meant it was satisfied by",
+        "somebody CHOOSING to run it. This project's whole lesson register is a list of things that",
+        "were supposed to happen because a document said so. So it goes on the clock and exits",
+        "non-zero: an unchecked product case becomes a failing job rather than a good intention.",
+        "",
+        "Service cases (a subscription, a membership, a bank fee) are exempt and say so - there is no",
+        "manufactured article to recall, and a gate that fires where it cannot apply is a gate people",
+        "mute. Read-only; it reports and never writes."
+      ],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL"
+      ],
+      "log": "mer_recall_sweep.log",
+      "steps": [
+        {
+          "module": "recall_research.py",
+          "args": [
+            "--sweep"
+          ],
+          "output": "log"
+        }
+      ],
+      "stdout": {
+        "mode": "alert"
+      }
+    },
     {
       "name": "mer-calendar-sync",
       "schedule": "30 14 * * *",
@@ -348,22 +583,41 @@
         "clock itself is auditable. Everything else here is silent-when-healthy, and a set of jobs",
         "that are all silent gives you no way to tell 'nothing wrong' from 'nothing running'."
       ],
-      "env_from_file": ["MULTICA_TOKEN", "MULTICA_WORKSPACE_ID", "MULTICA_SERVER_URL"],
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL"
+      ],
       "env": {},
       "log": "calendar_sync.log",
       "steps": [
-        { "module": "sync_deadlines.py", "args": ["--live"], "output": "log+match" },
-        { "module": "multica_calendar_sync.py", "args": [], "output": "log+match" }
+        {
+          "module": "sync_deadlines.py",
+          "args": [
+            "--live"
+          ],
+          "output": "log+match"
+        },
+        {
+          "module": "multica_calendar_sync.py",
+          "args": [],
+          "output": "log+match"
+        }
       ],
       "stdout": {
         "mode": "summary",
         "lines": [
-          { "match": "^summary", "prefix": "  deadlines: " },
-          { "match": "^calendar_sync", "prefix": "  calendar:  " }
+          {
+            "match": "^summary",
+            "prefix": "  deadlines: "
+          },
+          {
+            "match": "^calendar_sync",
+            "prefix": "  calendar:  "
+          }
         ]
       }
     },
-
     {
       "name": "mer-delivery-check",
       "schedule": "0 13,17,21 * * *",
@@ -377,11 +631,24 @@
         "Do not raise the frequency without lowering DELIVERY_CHECK_LOOKBACK_HOURS, or you will just",
         "re-report the same bounce more often."
       ],
-      "env_from_file": ["MER_PROFILE", "MER_GOOGLE_TOKEN_FILE", "MER_SENDER", "MER_SENT_LEDGER"],
-      "env": { "DELIVERY_CHECK_LOOKBACK_HOURS": "48" },
+      "env_from_file": [
+        "MER_PROFILE",
+        "MER_GOOGLE_TOKEN_FILE",
+        "MER_SENDER",
+        "MER_SENT_LEDGER"
+      ],
+      "env": {
+        "DELIVERY_CHECK_LOOKBACK_HOURS": "48"
+      },
       "log": "delivery_check.log",
       "steps": [
-        { "module": "delivery_check.py", "args": ["--cron"], "output": "alert" }
+        {
+          "module": "delivery_check.py",
+          "args": [
+            "--cron"
+          ],
+          "output": "alert"
+        }
       ],
       "stdout": {
         "mode": "alert",
@@ -390,7 +657,6 @@
         "fail_message": "delivery_check exited {rc} with no output - the bounce sweep did not complete."
       }
     },
-
     {
       "name": "mer-sol-watchdog",
       "schedule": "0 15 * * 1",
@@ -404,11 +670,23 @@
         "produce six identical answers and one useful one. Weekly is the correct sampling rate.",
         "Monday morning puts it at the start of a week with time left to act."
       ],
-      "env_from_file": ["MULTICA_TOKEN", "MULTICA_WORKSPACE_ID", "MULTICA_SERVER_URL"],
-      "env": { "SOL_ALERT_DAYS": "90" },
+      "env_from_file": [
+        "MULTICA_TOKEN",
+        "MULTICA_WORKSPACE_ID",
+        "MULTICA_SERVER_URL"
+      ],
+      "env": {
+        "SOL_ALERT_DAYS": "90"
+      },
       "log": "sol_watchdog.log",
       "steps": [
-        { "module": "sol_watchdog.py", "args": ["--cron"], "output": "alert" }
+        {
+          "module": "sol_watchdog.py",
+          "args": [
+            "--cron"
+          ],
+          "output": "alert"
+        }
       ],
       "stdout": {
         "mode": "alert",
@@ -417,7 +695,6 @@
         "fail_message": "sol_watchdog exited {rc} with no output - the SoL sweep did not complete."
       }
     },
-
     {
       "name": "mer-unmatched-review",
       "schedule": "30 15 * * 1",
@@ -440,10 +717,18 @@
         "MINIMAX_API_KEY",
         "MER_PROFILE"
       ],
-      "env": { "UNMATCHED_REVIEW_WINDOW": "newer_than:8d" },
+      "env": {
+        "UNMATCHED_REVIEW_WINDOW": "newer_than:8d"
+      },
       "log": "unmatched_review.log",
       "steps": [
-        { "module": "unmatched_review.py", "args": ["--cron"], "output": "alert" }
+        {
+          "module": "unmatched_review.py",
+          "args": [
+            "--cron"
+          ],
+          "output": "alert"
+        }
       ],
       "stdout": {
         "mode": "alert",

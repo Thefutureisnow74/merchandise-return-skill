@@ -114,6 +114,23 @@ KNOWN = [
     {"file": "delivery_check.py",   "llm_tolerant": False, "args": ["--selftest"]},
     {"file": "unmatched_review.py", "llm_tolerant": False, "args": ["--selftest"]},
     {"file": "heartbeat.py",        "llm_tolerant": False, "args": ["--selftest"]},
+    # M49/M50. stop_list is a GUARD (reserve_send refuses a blocked recipient and `override`
+    # does not lift it), so its self-test must run for the same reason idempotency's does.
+    # case_digest is read-only reporting, but its self-test also covers the E20 phone-action
+    # assertion — the one place that rule is actually enforced rather than written down.
+    {"file": "stop_list.py",        "llm_tolerant": False, "args": ["--selftest"]},
+    {"file": "case_digest.py",      "llm_tolerant": False, "args": ["--selftest"]},
+    # M51. Divergence between deployed copies is what SKILL.md §7 calls this skill's
+    # original sin; it recurred silently and was found by hand. The gate's own self-test
+    # matters as much as the gate: its first version reported 52 findings of which 49 were
+    # noise, and a gate that cries wolf is a gate somebody bypasses (§10 E19).
+    {"file": "drift_gate.py",       "llm_tolerant": False, "args": ["--selftest"]},
+    # M54. The recall sweep. Its own self-test earned its place immediately: the first
+    # version misread placeholder text ("N/A - subscription service") as a serial, matched
+    # the word "policy" anywhere in a case record and classified a paint sprayer as a
+    # service, and carried a regex in which \b had become a literal backspace byte so it
+    # matched nothing at all. Three silent wrongs in one small classifier.
+    {"file": "recall_research.py", "llm_tolerant": False, "args": ["--selftest"]},
     # --- THE STRUCTURAL GATES (M47) ------------------------------------------------------
     # These are the reason this file is not the only definition of done. check_wiring.py
     # --selftest tests the GATES (it builds synthetic orphans and rogue send calls in a temp

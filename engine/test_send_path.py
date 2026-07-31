@@ -161,7 +161,7 @@ def test_send_mime_refuses_without_token():
 
         # A real token works exactly once. We let it through the gate and then let the SMTP
         # guard stop it, which proves the gate passed and nothing else did.
-        r = idempotency.reserve_send("T", "a", "vendor@example.com", "body")
+        r = idempotency.reserve_send("T", "a", "vendor@example.com", "body", check_mailbox=False)
         try:
             gmail_transport.send_mime(msg, to_addrs=["vendor@example.com"], token=r["token"])
             check("a VALID token passes the gate", False, "expected the smtp guard to fire")
@@ -200,11 +200,11 @@ def test_cooldown_blocks_reworded_second_letter():
         check("the two letters really do have DIFFERENT exact keys (the old guard's blind spot)",
               k1 != k2)
 
-        r1 = idempotency.reserve_send("MER-7", "tier1", "care@relaxtheback.com", a)
+        r1 = idempotency.reserve_send("MER-7", "tier1", "care@relaxtheback.com", a, check_mailbox=False)
         idempotency.consume_send_token(r1["token"])
         idempotency.commit(r1["key"], gmail_id="g1")
 
-        r2 = idempotency.reserve_send("MER-7", "tier1", "care@relaxtheback.com", b)
+        r2 = idempotency.reserve_send("MER-7", "tier1", "care@relaxtheback.com", b, check_mailbox=False)
         check("the reworded second letter is BLOCKED by the cooldown", r2["ok"] is False,
               r2["reason"][:60])
         check("...and the block names the cooldown, not the exact key",
@@ -212,17 +212,17 @@ def test_cooldown_blocks_reworded_second_letter():
         check("...and no token was minted for it", r2["token"] is None)
 
         # a DIFFERENT recipient on the same case is unaffected
-        r3 = idempotency.reserve_send("MER-7", "tier2", "ceo@relaxtheback.com", b)
+        r3 = idempotency.reserve_send("MER-7", "tier2", "ceo@relaxtheback.com", b, check_mailbox=False)
         check("a different recipient on the same case is NOT blocked", r3["ok"] is True)
         idempotency.release(r3["key"])
 
         # a different CASE to the same recipient is unaffected
-        r4 = idempotency.reserve_send("MER-9", "tier1", "care@relaxtheback.com", b)
+        r4 = idempotency.reserve_send("MER-9", "tier1", "care@relaxtheback.com", b, check_mailbox=False)
         check("a different case to the same recipient is NOT blocked", r4["ok"] is True)
         idempotency.release(r4["key"])
 
         # override is allowed but must leave a trace
-        r5 = idempotency.reserve_send("MER-7", "tier1", "care@relaxtheback.com", b, override=True)
+        r5 = idempotency.reserve_send("MER-7", "tier1", "care@relaxtheback.com", b, override=True, check_mailbox=False)
         check("override=True is honoured", r5["ok"] is True)
         entry = idempotency._load()[r5["key"]]
         check("...and the override is RECORDED in the ledger entry",
@@ -232,7 +232,7 @@ def test_cooldown_blocks_reworded_second_letter():
 
         # a window of 0 disables the cooldown for callers who ask explicitly
         r6 = idempotency.reserve_send("MER-7", "tier1", "care@relaxtheback.com", b,
-                                      cooldown_hours=0)
+                                      cooldown_hours=0, check_mailbox=False)
         check("cooldown_hours=0 disables the coarse guard (exact key still applies)",
               r6["ok"] is True)
         idempotency.release(r6["key"])
@@ -383,7 +383,7 @@ def test_veto_persists_across_a_tick():
 def test_reserve_under_a_corrupt_ledger():
     print("\n--- 6. a CORRUPT ledger refuses to proceed (it used to reset the whole history) ---")
     with Sandbox() as sb:
-        r = idempotency.reserve_send("MER-6", "tier1", "vendor@example.com", "b")
+        r = idempotency.reserve_send("MER-6", "tier1", "vendor@example.com", "b", check_mailbox=False)
         idempotency.commit(r["key"], gmail_id="g")
         check("a real send is on the books", len(idempotency._load()) == 1)
 
@@ -396,7 +396,7 @@ def test_reserve_under_a_corrupt_ledger():
             check("reserve/_load refuses a corrupt ledger", True, str(e)[:44] + "...")
 
         try:
-            idempotency.reserve_send("MER-6", "tier1", "vendor@example.com", "b2")
+            idempotency.reserve_send("MER-6", "tier1", "vendor@example.com", "b2", check_mailbox=False)
             check("reserve_send() refuses rather than re-sending blind", False, "it returned")
         except idempotency.LedgerCorrupt:
             check("reserve_send() refuses rather than re-sending blind", True)
@@ -409,7 +409,7 @@ def test_reserve_under_a_corrupt_ledger():
         os.remove(sb.ledger)
         check("a MISSING ledger is an empty ledger, not an error", idempotency._load() == {})
         check("...and a send can be reserved on a cold install",
-              idempotency.reserve_send("MER-6", "tier1", "vendor@example.com", "b3")["ok"])
+              idempotency.reserve_send("MER-6", "tier1", "vendor@example.com", "b3", check_mailbox=False)["ok"])
 
         # a wrong-shaped-but-valid-JSON ledger is also corruption
         with open(sb.ledger, "w") as fh:
@@ -437,7 +437,7 @@ def test_reserve_under_a_read_only_ledger():
         os.chmod(sb.dir, 0o555)             # the DIRECTORY is what mkstemp needs
         try:
             try:
-                idempotency.reserve_send("MER-8", "tier1", "vendor@example.com", "b")
+                idempotency.reserve_send("MER-8", "tier1", "vendor@example.com", "b", check_mailbox=False)
                 check("reserve_send() on an unwritable ledger raises", False,
                       "it returned ok — the caller would have sent believing it was recorded")
             except (OSError, IOError, idempotency.LedgerCorrupt) as e:
@@ -491,7 +491,7 @@ CHILD = textwrap.dedent("""
     barrier = %(barrier)r
     while not os.path.exists(barrier):      # start both children as close together as possible
         time.sleep(0.005)
-    r = idempotency.reserve_send("RACE", "tier1", "vendor@example.com", "identical body")
+    r = idempotency.reserve_send("RACE", "tier1", "vendor@example.com", "identical body", check_mailbox=False)
     print(json.dumps({"ok": r["ok"], "reason": r["reason"]}))
 """)
 
@@ -578,7 +578,7 @@ def test_atomic_save_keeps_group_writable_permissions():
         mode = os.stat(sb.ledger).st_mode & 0o777
         check("the ledger is group-writable after a save (0664, not mkstemp's 0600)",
               mode & 0o060 == 0o060, oct(mode))
-        idempotency.reserve_send("MER-P", "tier1", "vendor@example.com", "b")
+        idempotency.reserve_send("MER-P", "tier1", "vendor@example.com", "b", check_mailbox=False)
         mode2 = os.stat(sb.ledger).st_mode & 0o777
         check("...and stays group-writable after every subsequent send", mode2 & 0o060 == 0o060,
               oct(mode2))

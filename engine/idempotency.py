@@ -375,16 +375,110 @@ def reserve(case, action, recipient, body, meta=None):
     return r["ok"], r["key"]
 
 
-def reserve_send(case, action, recipient, body, meta=None,
-                 cooldown_hours=None, override=False):
-    """Reserve an OUTBOUND EMAIL. Two-phase, cooled-down, tokenised.
+# =========================================================================================
+# M48 — THE LEDGER IS NOT THE LOCK. THE MAILBOX IS.
+#
+# INCIDENT #14, 2026-07-28. A PPG store manager received THREE near-identical replies to one
+# question in 2.5 hours: two from the VPS runtime 73 seconds apart, then a third from a Claude
+# Code session. `reserve_send()` returned ok every time. It was not bypassed — it was BLIND.
+#
+# This ledger is a file. Two runtimes send as the same Gmail account and each keeps its own copy,
+# so neither can see the other's reservations. SKILL.md §6.7 says the guard "makes a double-send
+# structurally impossible from any code path". That is only true of code paths SHARING A LEDGER,
+# which is a far smaller claim than the one the rule makes — and the 2026-07-18 double-send it
+# was written for came back at triple strength.
+#
+# The mailbox is the one resource every sender genuinely shares. So ask it.
+#
+# FAILS CLOSED, deliberately and with a cost. If the mailbox cannot be reached, a send is
+# REFUSED rather than waved through. A missed send is recoverable — it is queued, logged and
+# retried. A duplicate is not: it is in a stranger's inbox, and a vendor who receives three
+# copies of one letter reads the sender as chaotic. `override=True` remains the escape hatch,
+# same as everywhere else in this module.
+# =========================================================================================
+MAILBOX_LOOKBACK_HOURS = 24
 
-    Returns {"ok", "key", "token", "reason"[, "cooldown"]}.
+
+def _mailbox_guard_applies():
+    """The mailbox check guards LIVE mail only.
+
+    In `test` mode mer_send redirects every letter to the owner's own mailbox, so a second
+    drafted letter to any vendor would collide with the first one's redirect and the guard would
+    block the entire engine — while protecting nobody, because nothing reached a vendor. In `off`
+    mode nothing is sent at all. The duplicate this exists to prevent can only happen on the
+    wire, so only `live` is checked. Any other value (including unset) is treated as not-live.
+    """
+    return (os.environ.get("MER_ENGINE_SEND") or "").strip().lower() == "live"
+
+
+def mailbox_conflict(recipient, hours=None, token=None, _search=None):
+    """Has this mailbox ALREADY sent to `recipient` inside the window?
+
+    -> (conflict: bool|None, detail: str).  None means the check could not run — treat that as
+    a refusal, never as a pass. `_search` is injected by the self-test so this stays offline.
+    """
+    hours = MAILBOX_LOOKBACK_HOURS if hours is None else hours
+    addr = (recipient or "").strip().lower()
+    if not addr:
+        return None, "no recipient to check"
+    days = max(1, int((hours + 23) // 24))          # Gmail's newer_than granularity is days
+    query = "in:sent to:%s newer_than:%dd" % (addr, days)
+    try:
+        if _search is None:
+            import inbox_watcher                     # the one Gmail list implementation
+            if token is None:
+                import gmail_fetch
+                token = gmail_fetch.access_token()
+            msgs = inbox_watcher.list_messages(query, token)
+        else:
+            msgs = _search(query)
+    except Exception as e:                           # network, auth, quota — all mean "unknown"
+        return None, "mailbox check failed (%s: %s)" % (type(e).__name__, e)
+    n = len(msgs or [])
+    if n:
+        return True, "%d message(s) already sent to %s in the last %dh (%s)" % (
+            n, addr, hours, query)
+    return False, "no prior send to %s in the last %dh" % (addr, hours)
+
+
+def reserve_send(case, action, recipient, body, meta=None,
+                 cooldown_hours=None, override=False,
+                 check_mailbox=True, mailbox_hours=None, _search=None):
+    """Reserve an OUTBOUND EMAIL. Two-phase, cooled-down, tokenised, mailbox-checked.
+
+    Returns {"ok", "key", "token", "reason"[, "cooldown"][, "mailbox"]}.
       ok=True   -> caller may hand `token` to gmail_transport.send_mime(), then MUST call
                    commit(key, gmail_id) on success or release(key) on failure.
-      ok=False  -> caller MUST NOT send. `reason` says whether it was the exact-match key or
-                   the coarse (case, recipient) cooldown.
+      ok=False  -> caller MUST NOT send. `reason` says which guard refused: the exact-match key,
+                   the coarse (case, recipient) cooldown, or the MAILBOX (M48).
+
+    The mailbox check runs FIRST and is authoritative across runtimes; the local ledger stays as
+    the cheap, precise guard behind it. `check_mailbox=False` is for callers with no Gmail at all
+    (self-tests, board-only paths) — never as a way past a refusal.
     """
+    # M49 — the do-not-contact register comes FIRST, and `override` does NOT lift it. Every other
+    # guard here asks "have we already sent this?"; this one asks "are we allowed to send at all?"
+    # A withdrawn instruction the user gave once must not be overridable by a caller in a loop.
+    try:
+        import stop_list
+        blocked, why = stop_list.is_blocked(recipient, case=case)
+    except ImportError:                             # partial install: no register, no block
+        blocked, why = False, ""
+    except Exception as e:                          # corrupt register -> FAIL CLOSED
+        return {"ok": False, "key": None, "token": None,
+                "reason": "do-not-contact register unreadable, refusing to send (%s: %s)"
+                          % (type(e).__name__, e)}
+    if blocked:
+        return {"ok": False, "key": None, "token": None, "stop_list": why,
+                "reason": "DO NOT CONTACT: %s" % why}
+
+    if check_mailbox and not override and (_search is not None or _mailbox_guard_applies()):
+        conflict, detail = mailbox_conflict(recipient, hours=mailbox_hours, _search=_search)
+        if conflict is not False:                   # True (duplicate) or None (unknown) -> stop
+            return {"ok": False, "key": None, "token": None, "mailbox": detail,
+                    "reason": ("mailbox already has a send to this recipient: %s" % detail)
+                              if conflict else
+                              ("mailbox check could not run, refusing to send: %s" % detail)}
     return _reserve(case, action, recipient, body, meta,
                     kind="send", two_phase=True,
                     cooldown_hours=cooldown_hours, override=override)
@@ -578,21 +672,21 @@ if __name__ == "__main__":
     for p in (LEDGER, LEDGER + ".bak", _veto_path()):
         if os.path.exists(p):
             os.remove(p)
-    r1 = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 4.")
+    r1 = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 4.", check_mailbox=False)
     assert r1["ok"] and r1["token"], "reserve_send should mint a token"
     assert _load()[r1["key"]]["state"] == "pending", "a send reservation starts PENDING"
     release(r1["key"])
     assert _load() == {}, "release() must give the key back after a transport failure"
     print("failed send        -> reservation released =", True, "(expect True)")
 
-    r2 = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 4.")
+    r2 = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 4.", check_mailbox=False)
     consume_send_token(r2["token"])
     commit(r2["key"], gmail_id="gid123")
     assert _load()[r2["key"]]["state"] == "sent"
-    dup = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 11.")  # reworded!
+    dup = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 11.", check_mailbox=False)  # reworded!
     print("reworded 2nd letter -> ok_to_send =", dup["ok"], "(expect False — 48h cooldown)")
     assert not dup["ok"] and "cooldown" in dup["reason"], "COOLDOWN SELF-TEST FAILED"
-    ovr = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 11.", override=True)
+    ovr = reserve_send("CASE-9", "tier1", "vendor@example.com", "Refund by Aug 11.", override=True, check_mailbox=False)
     assert ovr["ok"] and _load()[ovr["key"]]["cooldown_override"] is True, \
         "an override must be recorded in the ledger entry"
     release(ovr["key"])
@@ -608,6 +702,47 @@ if __name__ == "__main__":
     assert was_vetoed("CASE-9", "tier2_followup") and was_vetoed("CASE-9")
     assert not was_vetoed("CASE-9", "tier1_followup")
     print("veto                -> persists across a tick =", True, "(expect True)")
+
+    # ---- M48: the mailbox is the lock. INCIDENT #14 — three copies of one letter, because two
+    # runtimes each consulted their own ledger file and neither could see the other's sends.
+    dup = reserve_send("CASE-M48", "tier1", "vendor@example.com", "body",
+                       _search=lambda q: ["already-sent-id"])
+    assert dup["ok"] is False, "a prior send in the mailbox must refuse"
+    assert "mailbox already has a send" in dup["reason"], dup["reason"]
+
+    unknown = reserve_send("CASE-M48", "tier1", "v2@example.com", "body",
+                           _search=lambda q: (_ for _ in ()).throw(IOError("gmail down")))
+    assert unknown["ok"] is False, "an unreachable mailbox must FAIL CLOSED, not wave through"
+    assert "could not run" in unknown["reason"], unknown["reason"]
+
+    clean = reserve_send("CASE-M48", "tier1", "v3@example.com", "body", _search=lambda q: [])
+    assert clean["ok"] is True and clean["token"], "a clean mailbox must still mint a token"
+    release(clean["key"])
+
+    forced = reserve_send("CASE-M48", "tier1", "vendor@example.com", "body",
+                          override=True, _search=lambda q: ["already-sent-id"])
+    assert forced["ok"] is True, "override=True remains the documented escape hatch"
+    release(forced["key"])
+
+    seen = []
+    mailbox_conflict("Mixed@Case.COM", hours=24, _search=lambda q: seen.append(q) or [])
+    assert seen == ["in:sent to:mixed@case.com newer_than:1d"], seen
+    print("mailbox guard       -> duplicate refused, unreachable refused, clean passes")
+
+    # The guard must not fire in test/off mode: there mer_send redirects every letter to the
+    # OWNER's mailbox, so it would collide with itself and block the engine while protecting
+    # nobody — nothing reached a vendor.
+    _prev = os.environ.get("MER_ENGINE_SEND")
+    try:
+        for mode, expect in (("live", True), ("test", False), ("off", False), ("", False)):
+            os.environ["MER_ENGINE_SEND"] = mode
+            assert _mailbox_guard_applies() is expect, "mode %r" % mode
+    finally:
+        if _prev is None:
+            os.environ.pop("MER_ENGINE_SEND", None)
+        else:
+            os.environ["MER_ENGINE_SEND"] = _prev
+    print("mailbox guard       -> live only; test/off exempt (self-collision would block all)")
 
     for p in (LEDGER, LEDGER + ".bak", _veto_path()):
         if os.path.exists(p):

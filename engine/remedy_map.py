@@ -82,6 +82,12 @@ CHARGEBACK_WINDOW_DAYS = 120
 # Deterministic emit order = ladder order (ladder.md phase table). Sorting by this rather
 # than alphabetically keeps the written property readable as an escalation sequence.
 LEVER_ORDER = [
+    # M53 — FIRST, before any letter. A recall reframes the whole case before Tier 1 is drafted:
+    # "your own maker or a federal regulator called this defective" beats every retention script,
+    # and recall remedies key off model+serial rather than proof of purchase — which is exactly the
+    # wall a lost-receipt case hits. Cheap to check, decisive when it lands. It leads the order
+    # because finding it AFTER the first letter wastes the strongest opening we will ever have.
+    "recall_check",
     "tier1_vendor",
     "tier2_exec",
     "industry_regulator",
@@ -237,6 +243,30 @@ INDUSTRY_RULES = [
         r"insurance (?:policy|claim|company|carrier)", r"\binsurer\b", r"claim denial",
         r"homeowners policy", r"auto policy",
     ]),
+    # M47 — consumer reporting agencies. Added 2026-07-28 after MER-79 (Experian) mapped to NO
+    # industry regulator at all: the rules above cover telecom, airlines, autos, utilities and
+    # insurance, and a case against a credit bureau fell through every one of them. The CFPB is
+    # not merely *an* option for a CRA — it directly supervises them and a complaint carries a
+    # mandatory company response, which makes it the single strongest lever on such a case. It
+    # had to be set by hand, and a lever that depends on somebody remembering is not a lever.
+    ("credit reporting", "the CFPB — consumerfinance.gov/complaint (a CRA is directly "
+                         "supervised; complaints carry a mandatory company response)", [
+        r"\bexperian\b", r"\bequifax\b", r"\btransunion\b", r"trans union",
+        r"credit bureau", r"credit[- ]reporting agency", r"\bcra\b",
+        r"credit monitoring", r"credit report", r"credit score subscription",
+        r"identityworks", r"creditworks", r"identity[- ]theft protection",
+        r"\bmyfico\b", r"lifelock", r"identity guard",
+    ]),
+    # Subscription / negative-option billing. MER-79 again: the wrong that needed a regulator was
+    # "cancelled and they kept charging", which no product-defect rule describes. ROSCA and the
+    # FTC negative-option rule are the on-point federal hooks.
+    ("subscription billing", "the FTC — reportfraud.ftc.gov (ROSCA, 15 U.S.C. sec 8403, and the "
+                             "negative-option rule: cancelling must be as easy as signing up)", [
+        r"negative option", r"auto[- ]?renew(?:al|ed|s)?", r"free trial",
+        r"recurring (?:charge|billing|payment)", r"\bsubscription\b", r"\bmembership fee\b",
+        r"cancelled but still (?:billed|charged)", r"charged after cancel",
+        r"could ?n[o']?t cancel", r"unable to cancel",
+    ]),
 ]
 
 # Financing / installment credit -> CFPB is the PRIMARY regulator (money-trail.md).
@@ -311,7 +341,7 @@ def resolve_state(text):
 
 
 def resolve_county(text):
-    """Pull a county/parish out of 'TX / Dallas County (Mesquite)'."""
+    """Pull a county/parish out of 'TX / Dallas County (Springfield)'."""
     if not text:
         return None
     m = re.search(r"([A-Z][A-Za-z .'-]+?)\s+(County|Parish)\b", str(text))
@@ -695,6 +725,26 @@ def build(case, today=None):
 
     def drop(key, reason):
         excl[key] = reason
+
+    # --- 0. THE RECALL CHECK (M53). Runs before the first letter is drafted, on every case.
+    #
+    # Always applicable, so always added. There is no product this cannot be asked about, and the
+    # answer "no recall found" is a real, loggable result — the lever is satisfied by HAVING
+    # LOOKED, not by finding something. Making it unconditional is deliberate: an optional check
+    # is a check that gets skipped on exactly the case that needed it.
+    _item = case.get("item") or "the item"
+    add("recall_check",
+        "Check CPSC/saferproducts.gov (and NHTSA for vehicles and child seats, FDA for food, "
+        "drugs, devices and cosmetics) plus the manufacturer's own recall and service-bulletin "
+        "pages for %s. A recall is the strongest single fact a consumer can hold: it moves the "
+        "argument from 'will this vendor help me' to 'this product was declared defective by its "
+        "own maker or by a federal regulator', which no retention script, expired warranty or "
+        "lost receipt can answer. Recall remedies are also keyed to MODEL AND SERIAL rather than "
+        "proof of purchase — the exact wall a lost-receipt case hits. Run it BEFORE Tier 1: found "
+        "afterwards, it wastes the strongest opening the case will ever have. NEVER stretch a "
+        "different model or brand into a match; 'no recall found' is the honest and useful "
+        "answer, and an overstated recall in a demand letter hands the vendor a reason to dismiss "
+        "a legitimate claim." % _item)
 
     # --- 1/2. The two vendor tiers. Every case has a vendor; both are always attemptable.
     vendor = case.get("vendor") or "the vendor"
@@ -1190,10 +1240,10 @@ def _selftest():
     tx_cash = {
         "identifier": "T-TXCASH", "vendor": "Riverside Hardware",
         "title": "Case: Riverside Hardware — pressure washer, $380",
-        "description": ("VENDOR/ITEM: Riverside Hardware (Mesquite) sold a pressure washer that "
+        "description": ("VENDOR/ITEM: Riverside Hardware (Springfield) sold a pressure washer that "
                         "failed after 4 uses. AMOUNT/CARD: $380 paid cash at the register — no "
                         "receipt card, paid cash. PURCHASE/DATES: 2025-03-04."),
-        "jurisdiction": "TX / Dallas County (Mesquite)", "state": "TX",
+        "jurisdiction": "TX / Dallas County (Springfield)", "state": "TX",
         "county": "Dallas County", "amount": 380.0, "purchase_date": date(2025, 3, 4),
         "discrimination_flag": False,
     }

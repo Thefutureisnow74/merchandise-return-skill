@@ -41,6 +41,7 @@ Run:
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -125,17 +126,191 @@ def missing_blocking(intake):
     return [k for k, _ in BLOCKING_FIELDS if _blank((intake or {}).get(k))]
 
 
+# M57 — EVERY CASE CARRIES A PLAIN-ENGLISH ITEM NAME, AND THE TWO ARE ALWAYS SAID TOGETHER.
+#
+# The user said it twice, the second time after the rule was already written down:
+# *"when you use MER I dont know what it means"*, then *"maybe use MER-3 Paint Sprayer? use this
+# style"*.
+#
+# That style is better than either extreme. A bare identifier means nothing to him. A bare item
+# name cannot be looked up. Together — "MER-3 Paint Sprayer" — the first half addresses the board
+# and the second half addresses the human, and neither has to be translated.
+#
+# The short name is a CATEGORY, not the product string: "Paint Sprayer", never "Graco Ultra
+# Cordless Handheld Airless". A category is what a person recognises a week later; a model number
+# is what they have to look up. It is also the only thing that tells his two Lowe's cases apart —
+# the vendor name cannot.
+#
+# A category cannot be reliably derived from a marketing string ("Craftsman 3000 PSI, 2.3 GPM Gas
+# Pressure Washer" yields "CRAFTSMAN 3000 PSI" if you take the first words, which is the brand, not
+# the thing). So it is ASKED FOR at intake and only guessed as a fallback.
+_CATEGORY_HINTS = [
+    ("pressure washer", "Pressure Washer"), ("dehumidifier", "Dehumidifier"),
+    ("sprayer", "Paint Sprayer"), ("recliner", "Massage Chair"), ("massage chair", "Massage Chair"),
+    ("chair", "Chair"), ("mattress", "Mattress"), ("tablet", "Tablet"), ("laptop", "Laptop"),
+    ("phone", "Phone"), ("tv", "TV"), ("television", "TV"), ("refrigerator", "Fridge"),
+    ("washer", "Washing Machine"), ("dryer", "Dryer"), ("mower", "Mower"), ("vacuum", "Vacuum"),
+    ("shoe", "Shoes"), ("sneaker", "Shoes"), ("boot", "Boots"), ("watch", "Watch"),
+    ("membership", "Membership"), ("subscription", "Subscription"), ("headphone", "Headphones"),
+    ("speaker", "Speaker"), ("camera", "Camera"), ("printer", "Printer"), ("monitor", "Monitor"),
+]
+
+
+def short_name(intake):
+    """The plain-English name that rides with the identifier. Asked for, then guessed."""
+    given = str((intake or {}).get("short_name") or "").strip()
+    if given:
+        return given.title()
+    blob = " ".join(str((intake or {}).get(k) or "") for k in ("item", "title")).lower()
+    for needle, label in _CATEGORY_HINTS:
+        if needle in blob:
+            return label
+    # Last resort: the first couple of words of the item, minus the brand if it looks like one.
+    words = [w for w in re.split(r"[\s,(\[]+", str((intake or {}).get("item") or "")) if w]
+    return " ".join(words[:2]).title() if words else ""
+
+
 def build_title(intake, client_name=None):
-    """Board title convention + the (INTAKE INCOMPLETE) suffix while any 🔴 is open."""
+    """"<Short Name> — <item>, bought at <vendor>". The short name leads so that the board, a
+    notification and a truncated digest line all say what the thing IS."""
     vendor = (intake.get("vendor") or "").strip() or "UNKNOWN VENDOR"
     item = (intake.get("item") or "").strip() or "UNKNOWN ITEM"
+    short = short_name(intake)
     if client_name:
-        title = "CLIENT: %s - %s via %s" % (client_name.strip(), item, vendor)
+        # Operator mode keeps the client first — there, WHOSE case it is outranks what the item is.
+        title = "CLIENT: %s — %s, bought at %s" % (client_name.strip(), short or item, vendor)
+    elif short:
+        title = "%s — %s, bought at %s" % (short, item, vendor)
     else:
-        title = "Case: %s / %s" % (vendor, item)
+        title = "%s — %s" % (item, vendor)
     if missing_blocking(intake):
+        # Kept UPPERCASE: it is the established board convention and appears in dup_guard and
+        # case_queries fixtures. The naming change is about the ITEM leading the title, not about
+        # restyling a marker other code already recognises.
         title += " (INTAKE INCOMPLETE)"
     return title
+
+
+# =========================================================================================
+# M47 — A CASE THAT CANNOT BE WATCHED MUST NOT BE OPENED SILENTLY.
+#
+# WHY THIS EXISTS. On 2026-07-28 MER-79 (Experian) was opened by this module and was invisible to
+# the mail watcher from the moment of creation. `case_queries.resolve()` derives a case's Gmail
+# query from that case's own board record, and MER-79's record carried no `MAIL FROM:` block, no
+# CONTACTS addresses, and no address anywhere in its prose — so it resolved to NOTHING and was
+# skipped. Seven older cases had queries; the newest did not. Two demand letters went out on that
+# case into a mailbox nothing was watching for the reply.
+#
+# `case_queries` was not at fault. Refusing to guess is its documented safety rule, because an
+# over-broad query (`from:gmail.com`) drags unrelated mail into a case where it gets classified
+# and, in the send lanes, answered. The bug is HERE: the create path never asked the question.
+#
+# So derive the watch scope at creation, write it into the description, and say so loudly when it
+# cannot be derived. Fixing this once at creation covers every future case; patching cases
+# afterwards covers one.
+#
+# DERIVATION IS DELIBERATELY CONSERVATIVE, in the same spirit as case_queries' own guard:
+#   1. real addresses supplied in the intake — always safe, always preferred;
+#   2. failing that, a domain guessed from the vendor NAME, and only when the guess is narrow: a
+#      vendor-specific slug of >= MIN_VENDOR_SLUG chars, not a generic word, not a known
+#      free-mail or shared-helpdesk host. "Experian" -> experian.com, "Lowe's" -> lowes.com,
+#      "Relax The Back" -> relaxtheback.com. A guess is LABELLED as a guess in the block so a
+#      human reading the board corrects it; it is never presented as established fact.
+#
+# A wrong guess costs one silent case. A too-broad guess costs the whole mailbox. That asymmetry
+# is why the stoplist below errs toward refusing.
+# =========================================================================================
+MIN_VENDOR_SLUG = 4
+
+# Words that are not a vendor. A case titled "Support" must not become from:support.com — that is
+# somebody else's domain, and a net besides.
+_GENERIC_VENDOR_WORDS = frozenset("""
+support service services customer care help helpdesk store shop online seller merchant vendor
+company inc llc ltd corp co the and unknown none various multiple retailer manufacturer maker
+dealer shipping delivery returns refund billing account accounts team
+""".split())
+
+_CORP_SUFFIXES = frozenset("inc llc ltd corp corporation co company plc gmbh sa nv ag".split())
+
+_VENDOR_STRIP_RE = re.compile(r"[^a-z0-9]+")
+_INTAKE_ADDR_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+
+try:                                        # one source of truth for "too broad to scope on"
+    import case_queries as _cq
+    _BROAD_HOSTS = _cq.BROAD_DOMAINS
+except Exception:                           # offline self-test / partial install
+    _BROAD_HOSTS = frozenset("""gmail.com googlemail.com yahoo.com hotmail.com outlook.com
+    live.com icloud.com aol.com proton.me protonmail.com gmx.com mail.com zoho.com
+    zendesk.com freshdesk.com helpscout.net intercom.io front.com""".split())
+
+
+def _dedupe_keep_order(seq):
+    out, seen = [], set()
+    for x in seq:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _vendor_slug(vendor):
+    """'Relax The Back' -> 'relaxtheback'. Returns '' when the name implies no usable domain.
+
+    Generic words are used to REJECT a name outright, never to edit one. Stripping them
+    word-by-word produced 'relaxback' for Relax The Back — a domain that is not theirs and
+    belongs to somebody. A brand's own filler words are part of its domain."""
+    raw = re.split(r"[(/]", (vendor or "").lower(), maxsplit=1)[0]
+    words = [w for w in _VENDOR_STRIP_RE.sub(" ", raw).split() if w]
+    if not words or all(w in _GENERIC_VENDOR_WORDS for w in words):
+        return ""
+    # A corporate suffix is never part of the domain: "Nike, Inc." is nike.com, not nikeinc.com.
+    # Trailing only — mid-name words stay, or "Relax The Back" loses its "the" again.
+    while len(words) > 1 and words[-1] in _CORP_SUFFIXES:
+        words.pop()
+    slug = "".join(words)
+    return "" if (len(slug) < MIN_VENDOR_SLUG or slug.isdigit()) else slug
+
+
+def derive_mail_from(intake, explicit=None):
+    """-> (tokens, provenance). `tokens` go into the MAIL FROM block; provenance is a short
+    human string naming where they came from. Never raises."""
+    if explicit:
+        return _dedupe_keep_order(
+            [t.strip().lower() for t in re.split(r"[\s,;|]+", explicit) if t.strip()]
+        ), "operator-supplied (--mail-from)"
+
+    me = ((intake or {}).get("user_email") or "").strip().lower()
+    my_host = me.split("@", 1)[1] if "@" in me else ""
+    # Strip the user's OWN HOST only when it is a company domain. If the user is on gmail.com,
+    # dropping every gmail.com address would discard the counterparty too: a case whose vendor
+    # contact is itself a free-mail address (a small trader, an individual seller) is watched by
+    # that exact address, and a blanket host filter would silently delete the only thing watching
+    # it. Real occurrence — the case survived only because this was caught.
+    strip_host = my_host if my_host and my_host not in _BROAD_HOSTS else ""
+
+    addrs, domains = [], []
+    for val in (intake or {}).values():
+        if not isinstance(val, str):
+            continue
+        for a in _INTAKE_ADDR_RE.findall(val):
+            a = a.lower()
+            host = a.split("@", 1)[1]
+            if a == me or (strip_host and host == strip_host):   # never watch the user's own mail
+                continue
+            addrs.append(a)
+            if host not in _BROAD_HOSTS:            # a shared host is kept only as a full address
+                domains.append(host)
+
+    domains = _dedupe_keep_order(domains)
+    toks = domains + [a for a in _dedupe_keep_order(addrs)
+                      if a.split("@", 1)[1] not in domains]
+    if toks:
+        return toks, "addresses found in the intake"
+
+    slug = _vendor_slug((intake or {}).get("vendor"))
+    if slug and (slug + ".com") not in _BROAD_HOSTS:
+        return [slug + ".com"], "GUESSED from the vendor name — verify and correct on the board"
+    return [], "nothing derivable"
 
 
 def build_description(intake, client_name=None):
@@ -176,6 +351,18 @@ def build_description(intake, client_name=None):
     lines.append("")
     lines.append("Opened by new_case.py. MR Phase=%s. Duplicate check ran BEFORE creation "
                  "(dup_guard)." % NEW_CASE_PHASE)
+
+    # M47 — the watch scope, written at creation so the case is monitorable from birth.
+    toks, prov = derive_mail_from(intake, explicit=intake.get("mail_from"))
+    lines.append("")
+    if toks:
+        lines.append("MAIL FROM: %s" % ", ".join(toks))
+        lines.append("  (watch scope — %s)" % prov)
+    else:
+        lines.append("MAIL FROM: (NONE DERIVED - THIS CASE IS UNWATCHED)")
+        lines.append("  No vendor address or domain could be derived from the intake, so "
+                     "case_queries will SKIP this case and no reply will ever be detected on it. "
+                     "Replace this line with `MAIL FROM: vendor.com` to fix it.")
     return "\n".join(lines)
 
 
@@ -438,6 +625,41 @@ def _selftest():
     print("\nTest 7 (no item, no email):\n   %s" % v7["reason"])
     check("refuses when there is nothing to dedupe on", v7["refused"] is True)
     check("nothing created", stub7.calls == [])
+
+    # 8) M47 — every created case carries a watch scope, or says loudly that it does not.
+    #    MER-79 was opened blind and stayed unwatched for a day; these are that bug's tests.
+    d_guess = build_description({"vendor": "Experian", "item": "membership",
+                                 "user_email": "me@example.com"})
+    check("M47: a vendor-only case still gets a MAIL FROM block",
+          "MAIL FROM: experian.com" in d_guess, d_guess[-200:])
+    check("M47: a guessed scope is labelled as a guess",
+          "GUESSED from the vendor name" in d_guess)
+
+    d_addr = build_description({"vendor": "Lowe's", "item": "washer",
+                                "prior_contact": "wrote customercare@lowes.com",
+                                "user_email": "me@example.com"})
+    check("M47: a real address in the intake beats the guess",
+          "MAIL FROM: lowes.com" in d_addr and "GUESSED" not in d_addr)
+
+    d_blind = build_description({"vendor": "Support", "item": "thing"})
+    check("M47: an underivable case says UNWATCHED in the record, not nothing",
+          "THIS CASE IS UNWATCHED" in d_blind, d_blind[-200:])
+
+    check("M47: a brand's filler words survive (Relax The Back -> relaxtheback)",
+          _vendor_slug("Relax The Back") == "relaxtheback", _vendor_slug("Relax The Back"))
+    check("M47: a corporate suffix does not (Nike, Inc. -> nike)",
+          _vendor_slug("Nike, Inc.") == "nike", _vendor_slug("Nike, Inc."))
+    check("M47: a generic name yields no domain", _vendor_slug("Customer Service") == "")
+    check("M47: never scopes on a free-mail host",
+          derive_mail_from({"vendor": "Zzz", "c": "rep@gmail.com"})[0] == ["rep@gmail.com"])
+    check("M47: a counterparty on the user's own free-mail host is KEPT",
+          derive_mail_from({"vendor": "T-Mobile", "user_email": "me@gmail.com",
+                            "c": "kim@gmail.com"})[0] == ["kim@gmail.com"])
+    check("M47: the user's own company host is stripped",
+          derive_mail_from({"vendor": "Acme Tools", "user_email": "d@mine.com",
+                            "c": "billing@mine.com help@acmetools.com"})[0] == ["acmetools.com"])
+    check("M47: an explicit override wins outright",
+          derive_mail_from({"vendor": "Acme"}, explicit="a.com, b@c.com")[0] == ["a.com", "b@c.com"])
 
     print("")
     for status, name, detail in results:

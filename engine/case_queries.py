@@ -104,6 +104,77 @@ def parse_vendor(desc):
     return left
 
 
+# =========================================================================================
+# M52 — SPEAK IN PLAIN NAMES. "MER-76" is a database key, not a name.
+#
+# On 2026-07-29 the user said, of his own cases: *"when you use MER I dont know what it means."*
+# He was right, and it had been happening for two days: status reports, next-actions and whole
+# summaries were written in MER-1 / MER-3 / MER-76, which are Multica's auto-generated row ids.
+# They are perfect for the engine and meaningless to the person whose money is at stake.
+#
+# Worse than meaningless — actively risky. A person who cannot tell MER-74 from MER-75 (both
+# Lowe's, different items) cannot check whether the right one is being escalated, and cannot
+# catch us when we are wrong. Every correction he has made this week came from recognising a
+# THING: the chair, the sprayer, the shoes.
+#
+# So the identifier is never the label. `case_label()` renders "Relax The Back - Perfect Chair
+# PC-610" from the record, and the id rides along in parentheses only where a lookup needs it.
+# =========================================================================================
+_TITLE_PREFIX_RE = re.compile(r"^\s*(?:case|client)\s*:\s*", re.I)
+#: Trailing status/bookkeeping that is not part of the thing's name.
+_TITLE_NOISE_RE = re.compile(
+    r"\s*[-–—(]\s*(?:\$[\d,]+.*|tier\s*\d.*|intake\s+incomplete.*|shipped\b.*"
+    r"|awaiting\b.*|cancelled\b.*|vendor\s+deflect.*|refund\s+sought.*|claim\s*#.*)$", re.I)
+
+
+def case_label(issue_or_title, with_id=False):
+    """A name a human recognises. 'MER-76' -> 'Relax The Back - Perfect Chair PC-610'.
+
+    Never raises; falls back to the identifier only when there is genuinely no title to use."""
+    ident, title = "", ""
+    if isinstance(issue_or_title, dict):
+        ident = issue_or_title.get("identifier") or ""
+        title = issue_or_title.get("title") or ""
+    else:
+        title = str(issue_or_title or "")
+    name = _TITLE_PREFIX_RE.sub("", title).strip()
+    for _ in range(3):                              # strip stacked trailing clauses
+        stripped = _TITLE_NOISE_RE.sub("", name).strip(" -–—")
+        if stripped == name:
+            break
+        name = stripped
+    name = re.sub(r"\s+", " ", name).strip(" -–—")
+    if not name:
+        return ident or "(unnamed case)"
+    if len(name) > 58:
+        name = name[:55].rstrip() + "..."
+    return "%s (%s)" % (name, ident) if (with_id and ident) else name
+
+
+def case_ref(issue_or_title):
+    """The user's own preferred form: "MER-3 Paint Sprayer".
+
+    Asked for by name on 2026-07-30 — *"maybe use MER-3 Paint Sprayer? use this style"* — after a
+    bare identifier confused him twice. It is the right compromise and worth stating why: the
+    identifier is the only thing that can be looked up on the board, and the short name is the only
+    thing a human recognises a week later. Neither works alone, so they always travel together.
+
+    The short name is the title's lead segment, before the em dash: titles are written
+    "Paint Sprayer — Graco Ultra, bought at PPG White Rock", so the lead IS the plain-English name.
+    Falls back to the full label, then to the bare identifier, so this never returns nothing."""
+    ident, title = "", ""
+    if isinstance(issue_or_title, dict):
+        ident = issue_or_title.get("identifier") or ""
+        title = issue_or_title.get("title") or ""
+    else:
+        title = str(issue_or_title or "")
+    label = case_label({"identifier": ident, "title": title})
+    short = re.split(r"\s+[—–-]\s+", label, maxsplit=1)[0].strip()
+    if not short or short == ident:
+        return ident or label
+    return ("%s %s" % (ident, short)).strip() if ident else short
+
+
 # Engine-build milestones (M1..M42) live in this project and are not cases.
 BUILD_PROJECT = "13805886-7b4d-45bf-b985-32128f91b288"
 
@@ -408,6 +479,50 @@ def log_skips(skipped, out=None):
             printer("       (%s)" % cq.title[:90])
 
 
+# =========================================================================================
+# M47 — THE COVERAGE INVARIANT: every live case is watched, or somebody is told.
+#
+# `log_skips` prints. Printing is not telling. On 2026-07-28 MER-79 was skipped from the moment
+# it was created and nobody learned of it for a day — the skip line went to a log that runs on a
+# host nobody was reading, and two demand letters went out on a case with no watcher behind them.
+#
+# The difference between this and log_skips is the EXIT CODE. `audit()` is meant to be scheduled,
+# so an unwatched case becomes a failing job — the one signal that reliably escalates — instead
+# of a line in a file. Same data, consequences attached.
+# =========================================================================================
+def audit(issues=None):
+    """-> (watched, unwatched) as lists of CaseQuery. Read-only, never raises on bad records."""
+    if issues is None:
+        import multica_api as mc
+        issues = mc.list_issues()
+    resolved = resolve_cases(issues)
+    return ([q for q in resolved if not q.skipped],
+            [q for q in resolved if q.skipped])
+
+
+def audit_report(issues=None, out=None):
+    """Human-readable coverage report. -> number of UNWATCHED cases (0 == healthy)."""
+    printer = out or (lambda s: sys.stdout.write(s + "\n"))
+    watched, unwatched = audit(issues)
+    total = len(watched) + len(unwatched)
+    printer("=" * 78)
+    printer("MAIL COVERAGE AUDIT — %d of %d live case(s) are being watched" % (len(watched), total))
+    printer("=" * 78)
+    for q in watched:
+        printer("  OK   %-8s %s" % (q.identifier, str(q.query)[:88]))
+    if not unwatched:
+        printer("")
+        printer("  every live case has a watch scope.")
+        return 0
+    printer("")
+    printer("  %d UNWATCHED CASE(S) — no reply to these will EVER be detected:" % len(unwatched))
+    for q in unwatched:
+        printer("    %-8s %s" % (q.identifier, (q.title or "")[:70]))
+        printer("             why: %s" % q.reason)
+        printer("             fix: add `MAIL FROM: vendor.com` to the issue description")
+    return len(unwatched)
+
+
 def case_queries(issues=None, log=True, out=None):
     """identifier -> Gmail query for every watchable case. Skips are logged, never silent."""
     if issues is None:
@@ -709,11 +824,48 @@ def _self_test():
     if bad:
         print("SELF-TEST FAILED — %d of %d checks failed" % (bad, len(results)))
         sys.exit(1)
+    # M52 — the identifier is a lookup key, never the name a human reads.
+    check("case_label strips the Case:/CLIENT: prefix",
+          case_label({"identifier": "MER-7", "title": "Case: Lowe's / Craftsman washer"})
+          == "Lowe's / Craftsman washer")
+    check("case_label drops trailing money and status noise",
+          case_label({"identifier": "MER-76",
+                      "title": "Case: Relax The Back / Perfect Chair PC-610 - $3,000, Tier 1 sent"})
+          == "Relax The Back / Perfect Chair PC-610")
+    check("case_label drops an (INTAKE INCOMPLETE) suffix",
+          case_label({"identifier": "MER-75",
+                      "title": "Case: Lowe's / Hisense Dehumidifier (INTAKE INCOMPLETE)"})
+          == "Lowe's / Hisense Dehumidifier")
+    check("case_label falls back to the id only when there is no title",
+          case_label({"identifier": "MER-9", "title": ""}) == "MER-9")
+    check("case_label can append the id when a lookup needs it",
+          case_label({"identifier": "MER-1", "title": "Case: HighLevel / refund"}, with_id=True)
+          == "HighLevel / refund (MER-1)")
+    check("case_label never raises on junk", case_label(None) == "(unnamed case)")
+
+    # M57 — the user's own naming style: "MER-3 Paint Sprayer".
+    check("case_ref pairs the identifier with the plain-English name",
+          case_ref({"identifier": "MER-3",
+                    "title": "Paint Sprayer - Graco Ultra, bought at PPG White Rock"})
+          == "MER-3 Paint Sprayer")
+    check("case_ref handles an em dash as well as a hyphen",
+          case_ref({"identifier": "MER-76",
+                    "title": "Massage Chair — Human Touch PC-610, bought at Relax The Back"})
+          == "MER-76 Massage Chair")
+    check("case_ref falls back to the identifier when there is no title",
+          case_ref({"identifier": "MER-9", "title": ""}) == "MER-9")
+    check("case_ref never returns an empty string",
+          case_ref({"identifier": "", "title": ""}) not in ("", None))
+
     print("PASS — case_queries self-test: %d/%d checks passed" % (len(results), len(results)))
 
 
 if __name__ == "__main__":
-    if "--board" in sys.argv:
+    if "--audit" in sys.argv:
+        # M47 — schedulable. EXIT 1 when any live case is unwatched, so the job fails loudly
+        # instead of logging quietly. This is the whole point of it not being log_skips.
+        sys.exit(1 if audit_report() else 0)
+    elif "--board" in sys.argv:
         _board_report()
     else:
         _self_test()

@@ -85,10 +85,20 @@ __all__ = [
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# The manifest, in search order. `schedule.json.example` is LAST and is the shipped default —
-# a complete working manifest, not a stub. It carries the .example suffix only because that is
-# what the packager's file whitelist ships; see its own _readme.
-MANIFEST_SEARCH_NAMES = ("schedule.json", "schedule.json.example")
+# The manifest. ONE name, no fallback, deliberately.
+#
+# This was ("schedule.json", "schedule.json.example") and returned the FIRST hit. That search
+# order cost three days on 2026-07-28/29: an untracked schedule.json on the VPS SHADOWED the
+# shipped example, so every fix applied to the example was a silent no-op and `cat schedule.json`
+# afterwards still showed the bug — which read as "it keeps reverting." A two-entry search order
+# IS a shadowing mechanism. There is no version of "try the next one" that is safe for the file
+# that decides when a system sends legal correspondence.
+#
+# The shipped manifest is now simply `schedule.json`: a complete working default, tracked in git
+# and pushed by deploy.sh like any other engine file. If you want a local override, set
+# $MER_SCHEDULE — an explicit path, visible in the process environment, not a file that quietly
+# outranks the one you edited.
+MANIFEST_SEARCH_NAMES = ("schedule.json",)
 MANIFEST_ENV_VAR = "MER_SCHEDULE"
 
 # The markers that delimit our managed block in a crontab. Everything between them is ours to
@@ -295,10 +305,40 @@ def manifest_search_path(explicit=None, cfg=None, env=None):
     return uniq
 
 
+def _assert_no_shadow_manifest(base):
+    """Refuse to run if more than one schedule.json* sits in the scripts dir.
+
+    A leftover schedule.json.bak / .example / .old must be an ERROR, not a silent loser. The
+    whole defect this guard exists for was a second manifest quietly outranking the real one;
+    collapsing MANIFEST_SEARCH_NAMES to a single name fixes the *search*, but it does nothing
+    about a human (or a hurried agent) dropping `schedule.json.bak` next to it and later editing
+    the wrong file. Making the ambiguity fatal is the only version that stays fixed.
+    """
+    try:
+        siblings = sorted(n for n in os.listdir(base)
+                          if n.startswith("schedule.json") and n != "schedule.json")
+    except OSError:
+        return
+    if siblings:
+        raise SchedulerError(
+            "ambiguous manifest: %s also contains %s alongside schedule.json.\n"
+            "  Exactly one manifest may exist. A second schedule.json* file is how the live\n"
+            "  schedule silently diverged from the committed one for three days on 2026-07-28.\n"
+            "  Move the extras somewhere that is not the scripts dir, or delete them:\n"
+            "    %s\n"
+            "  To run a deliberate alternate manifest, set $%s to its path instead."
+            % (base, ", ".join(siblings),
+               "\n    ".join(os.path.join(base, n) for n in siblings), MANIFEST_ENV_VAR))
+
+
 def load_manifest(explicit=None, cfg=None, env=None):
     candidates = manifest_search_path(explicit, cfg, env)
     if explicit and not os.path.isfile(str(explicit)):
         raise SchedulerError("manifest not found at the path you gave: %s" % explicit)
+    # Only guard the scripts dir, and only when no explicit path was given — an operator who
+    # names a manifest outright has already said which one they mean.
+    if not explicit and not (env or os.environ).get(MANIFEST_ENV_VAR):
+        _assert_no_shadow_manifest(cfg.scripts_dir if cfg else HERE)
     for path in candidates:
         if os.path.isfile(path):
             try:
@@ -311,7 +351,7 @@ def load_manifest(explicit=None, cfg=None, env=None):
             return Manifest(data, path)
     raise SchedulerError(
         "no job manifest found.\n  Searched, in order:\n    %s\n"
-        "  The package ships one (schedule.json.example) next to scheduler.py; if it is gone,\n"
+        "  The package ships one (schedule.json) next to scheduler.py; if it is gone,\n"
         "  reinstall the engine or point $%s at a manifest."
         % ("\n    ".join(candidates), MANIFEST_ENV_VAR))
 
@@ -1313,7 +1353,7 @@ def selftest(out=None):
         # ---------------------------------------------------------------- 1. the shipped manifest
         m = load_manifest()
         check("shipped manifest loads", isinstance(m, Manifest), m.source)
-        check("shipped manifest is the .example default or a user copy",
+        check("shipped manifest is the one and only schedule.json",
               os.path.basename(m.source) in MANIFEST_SEARCH_NAMES, m.source)
         check("shipped manifest defines jobs", len(m.jobs) >= 6, "%d jobs" % len(m.jobs))
         cfg0 = Config(scripts_dir=HERE)
@@ -1340,7 +1380,7 @@ def selftest(out=None):
             (r"\+\d{10,15}", "a phone number"),
         ]
         for path in (os.path.abspath(__file__),
-                     os.path.join(HERE, "schedule.json.example")):
+                     os.path.join(HERE, MANIFEST_SEARCH_NAMES[0])):
             src = open(path, encoding="utf-8").read()
             for rx, why in forbidden:
                 check("%s carries no %s" % (os.path.basename(path), why),
@@ -1353,11 +1393,18 @@ def selftest(out=None):
                                src)
             check("%s carries no workspace uuid" % os.path.basename(path), not uuids)
 
-        # a fresh install must not auto-send on day one
+        # A fresh install must not auto-send on day one. As of 2026-07-29 the strongest form of
+        # that guarantee is that the manifest does not carry the switch AT ALL: unset means
+        # mer_send.mode() == "off", so a new operator cannot mail a vendor until they put
+        # MER_ENGINE_SEND in their own environment. "test" and "off" remain acceptable for a
+        # manifest that still declares it; "live" never is, in any manifest, ever.
         engine = m.get("mer-engine")
         check("shipped manifest does NOT ship the send switch live",
-              engine.env.get("MER_ENGINE_SEND") in ("test", "off"),
+              engine.env.get("MER_ENGINE_SEND") in (None, "test", "off"),
               engine.env.get("MER_ENGINE_SEND"))
+        check("shipped manifest leaves send mode to the host entirely",
+              "MER_ENGINE_SEND" not in engine.env,
+              "still declared in-manifest: %r" % engine.env.get("MER_ENGINE_SEND"))
 
         # ------------------------------------------------------------------ 3. config indirection
         a = Config(python="/a/py", scripts_dir="/a/dir", tag="ta")
@@ -1488,7 +1535,7 @@ def selftest(out=None):
         # The property worth testing is the CONVENTION (namespaced \<tag>\<job>-HHMM, /ST
         # HH:MM, WEEKLY + /D <dow> when the expression restricts weekdays, one task per
         # firing time), so the expected values are computed from the job's own cron
-        # expression. Change the schedule in schedule.json.example and this stays green;
+        # expression. Change the schedule in schedule.json and this stays green;
         # break the naming or expansion rule and it goes red.
         calls = []
         st = SchtasksBackend(runner=lambda argv: (calls.append(argv), (0, "", ""))[1])

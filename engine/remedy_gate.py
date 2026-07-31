@@ -85,6 +85,23 @@ LEVER_LABELS = {
     "class_action": "Class-action check",
     "nonprofit_mediation": "Local nonprofit / mediation",
     "online_reviews": "Public review / reputation channel",
+    # M53 — the RECALL CHECK, run at Tier 0 before a single letter goes out.
+    #
+    # A recall is the single most powerful fact a consumer can hold, and it is the one nobody
+    # thinks to look for. It moves the argument off "is this vendor willing to help me" and onto
+    # "this product was declared defective by its own maker or by a federal regulator" — which no
+    # retention script, no expired warranty and no lost receipt can answer. Where a recall exists,
+    # a receipt is usually irrelevant: recall remedies are keyed to the model and serial, not to
+    # proof of purchase, which is exactly the wall a lost-receipt case hits.
+    #
+    # It is deliberately its own lever rather than a note inside class_action: a recall is a
+    # regulator-or-manufacturer FINDING, while a class action is other people's litigation. They
+    # carry different weight and one does not imply the other.
+    #
+    # Sources: CPSC / saferproducts.gov (consumer goods), NHTSA (vehicles and child seats),
+    # FDA (food, drugs, devices, cosmetics), USDA FSIS (meat and poultry), plus the
+    # manufacturer's own recall and service-bulletin pages.
+    "recall_check": "Manufacturer / regulator recall + documented-defect check (CPSC, NHTSA, FDA)",
     "tier4_court": "Tier 4 — small-claims court",
     "small_claims": "Tier 4 — small-claims court",
     "court": "Tier 4 — small-claims court",

@@ -375,3 +375,69 @@ Sent {{today_date}}.
 5. **Honor the autonomy lane** — 🟡 auto-send after the veto window; 🔴 wait for the user's YES.
 6. **Log the send** as an `EVENT:` line + a `RECORD ONLY` comment on the case, and capture the
    outbound Message-ID so the next tier can reference it as `{{prior_message_id}}`.
+
+---
+
+## TRE file disclosure — request the user's own return-history file
+
+**To:** `consumerinquiry@theretailequation.com`
+**Lane:** RED — a new recipient. Explicit yes from the user before sending.
+**When:** at intake, once, after the §1.7 disclosure. Not tied to any vendor case.
+
+> ⚠️ **This is an FCRA FILE DISCLOSURE, not a Return Activity Report.** The RAR portal needs a
+> Transaction ID from a receipt where a return was *warned or denied*. A user who has never been
+> denied has no such ID and cannot use it. The file-disclosure right does not depend on a denial
+> and is free at least annually. Do not send a user to the RAR portal unless they were actually
+> refused at a counter.
+
+**Subject:** Request for file disclosure under FCRA §609 — [FULL NAME]
+
+```
+To The Retail Equation / Appriss Retail,
+
+I am requesting a copy of my consumer file under the Fair Credit Reporting Act.
+
+This is a request for file disclosure under FCRA § 609, and for the free annual disclosure
+provided by FCRA § 612. It is not a Return Activity Report request tied to a specific
+transaction — I have not had a return denied, so I have no Transaction ID. My right to a copy
+of my file does not depend on a denial having occurred.
+
+Please send me:
+
+1. All information in my consumer file, including every return and exchange transaction
+   attributed to me and the retailer associated with each.
+2. Any risk score, rating or classification applied to me, and how it is expressed.
+3. The sources of the information in my file.
+4. A list of everyone who has received a consumer report about me in the past two years, and
+   for what purpose.
+
+My details:
+
+  Full legal name : [FULL LEGAL NAME]
+  Current address : [MAILING ADDRESS]
+  Previous address: [IF MOVED IN THE LAST 2 YEARS]
+  Date of birth   : [DOB]
+  Email           : [EMAIL]
+
+Please tell me what identity verification you require and I will provide it. Please send the
+disclosure, and all further correspondence, to the email address above — I handle these matters
+in writing.
+
+If you contend I am not entitled to a file disclosure, please say so in writing and cite the
+provision you are relying on.
+
+Thank you,
+[FULL LEGAL NAME]
+```
+
+**Drafting notes**
+
+- **Ask for the score and the recipient list, not just the transactions.** The score is the thing
+  that actually gets a return refused, and the two-year recipient list shows which retailers have
+  been pulling it. Most people ask only for the transactions and learn the least useful part.
+- **Never redact the request into vagueness.** A CRA responds to what was asked; each numbered item
+  maps to a distinct FCRA entitlement.
+- **The closing line is deliberate.** A refusal in writing, citing a provision, is a usable document.
+  Silence is not.
+- **Do not include an SSN unless they demand it and the user agrees.** Offer verification rather
+  than volunteering identifiers into a file that is already about them.
