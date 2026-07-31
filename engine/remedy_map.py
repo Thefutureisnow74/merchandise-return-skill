@@ -341,7 +341,7 @@ def resolve_state(text):
 
 
 def resolve_county(text):
-    """Pull a county/parish out of 'TX / Dallas County (Mesquite)'."""
+    """Pull a county/parish out of 'TX / Dallas County (Springfield)'."""
     if not text:
         return None
     m = re.search(r"([A-Z][A-Za-z .'-]+?)\s+(County|Parish)\b", str(text))
@@ -1240,10 +1240,10 @@ def _selftest():
     tx_cash = {
         "identifier": "T-TXCASH", "vendor": "Riverside Hardware",
         "title": "Case: Riverside Hardware — pressure washer, $380",
-        "description": ("VENDOR/ITEM: Riverside Hardware (Mesquite) sold a pressure washer that "
+        "description": ("VENDOR/ITEM: Riverside Hardware (Springfield) sold a pressure washer that "
                         "failed after 4 uses. AMOUNT/CARD: $380 paid cash at the register — no "
                         "receipt card, paid cash. PURCHASE/DATES: 2025-03-04."),
-        "jurisdiction": "TX / Dallas County (Mesquite)", "state": "TX",
+        "jurisdiction": "TX / Dallas County (Springfield)", "state": "TX",
         "county": "Dallas County", "amount": 380.0, "purchase_date": date(2025, 3, 4),
         "discrimination_flag": False,
     }

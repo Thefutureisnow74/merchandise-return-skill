@@ -24,8 +24,16 @@ This module answers that, from the two sources that are shared by every actor:
 It reads the MAILBOX for outbound, deliberately, not the ledger. The ledger is per-runtime and
 that is exactly the blindness being fixed (see idempotency M48).
 
-STRICTLY READ-ONLY. It never writes to the board, never sends, never touches the ledger. A
-reporting tool that can act is a reporting tool that can cause an incident.
+READ-ONLY TOWARD EVERY COUNTERPARTY. It never writes to the board, and it never sends to a
+vendor, a regulator or anyone else involved in a case. A reporting tool that can act is a
+reporting tool that can cause an incident.
+
+The ONE exception, and it is bounded on purpose: `--email` mails the finished digest to the
+profile owner's own address and nowhere else (`email_digest()`). It therefore does reserve an
+idempotency entry, so the blanket "never touches the ledger" that used to sit here is no longer
+true and has been corrected rather than left to rot — a docstring that overstates a safety
+property is worse than one that admits a bounded exception, because the next reader trusts it.
+The recipient is the profile owner, never an argument from a case.
 
 CLI
     case_digest.py --selftest        offline, stubbed, no network
@@ -562,16 +570,43 @@ def _raises(fn, exc=Exception):
         return False
 
 
+def email_digest(text, n, to=None):
+    """Send the digest to the OWNER. Never to a vendor — this is the one outbound this module has.
+
+    Routed through mer_send so the send-path gate holds (only mer_send may reach the transport).
+    The idempotency action carries the DATE, so each day is a distinct logical send and a rerun on
+    the same day is correctly suppressed. The mailbox guard is disabled for this one path on
+    purpose: it exists to stop a second letter reaching a VENDOR, and every prior digest was sent
+    to the owner's own address, so it would block the daily report by design.
+    """
+    import mer_send
+    import mer_config
+    to = to or (mer_config.profile() or {}).get("email")
+    if not to:
+        return {"sent": False, "reason": "no owner email in the profile — refusing to guess"}
+    day = _now().strftime("%Y-%m-%d")
+    return mer_send.send(
+        to, "Case digest %s — %d item(s) need attention" % (day, n), text,
+        case="DIGEST", action="daily_digest_%s" % day, override=True)
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="cross-runtime status digest (read-only)")
+    ap = argparse.ArgumentParser(description="cross-runtime status digest (read-only to vendors)")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--markdown", action="store_true")
+    ap.add_argument("--email", action="store_true",
+                    help="also email the digest to the profile owner (never to a vendor)")
     a = ap.parse_args(argv)
     if a.selftest:
         return 0 if _selftest() else 1
     rows = gather()
     text, n = render(rows, markdown=a.markdown)
     print(text)
+    if a.email:
+        r = email_digest(text, n)
+        print("")
+        print("-- email: %s"
+              % ("sent to the owner" if r.get("sent") else r.get("reason")))
     return 0
 
 

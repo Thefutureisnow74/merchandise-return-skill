@@ -226,8 +226,8 @@ def _selftest():
 
     check("an empty register blocks nobody", is_blocked("x@y.com")[0] is False)
 
-    block("ronald.pfrsales@gmail.com", case=None, why="user withdrew contact", live=True)
-    b, why = is_blocked("ronald.pfrsales@gmail.com", case="MER-79")
+    block("withdrawn.contact@example.com", case=None, why="user withdrew contact", live=True)
+    b, why = is_blocked("withdrawn.contact@example.com", case="MER-79")
     check("a global block applies to every case", b is True, why)
     check("the reason is carried back", "withdrew" in why, why)
     check("a free-mail host does NOT promote to a domain block",
@@ -251,7 +251,7 @@ def _selftest():
     check("release is recorded in history",
           any(h.get("event") == "release" for h in _load()["history"]))
     check("the global block survives an unrelated release",
-          is_blocked("ronald.pfrsales@gmail.com")[0] is True)
+          is_blocked("withdrawn.contact@example.com")[0] is True)
 
     with open(REGISTER, "w", encoding="utf-8") as fh:
         fh.write('{"blocks": ')                       # truncated mid-write

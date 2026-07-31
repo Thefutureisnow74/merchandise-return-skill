@@ -104,8 +104,8 @@
     },
     {
       "name": "mer-digest",
-      "schedule": "0 13 * * *",
-      "schedule_human": "daily 13:00 UTC = 08:00 CT (CDT), at the start of the working day",
+      "schedule": "5 20 * * *",
+      "schedule_human": "daily 20:05 UTC = 15:05 CT (CDT) — the 3PM audit the user asked for; 14:05 CT under CST, the unavoidable fixed-UTC DST drift",
       "description": "Cross-runtime status digest: every case, every unanswered reply, every send by ANY actor.",
       "why_on_a_clock": [
         "M50. The board says what the state is. A local ledger says what THIS runtime did. Neither",
@@ -122,7 +122,17 @@
         "outbound from `in:sent`, not from a ledger. That is what makes another runtime's work",
         "visible instead of looking like neglect.",
         "",
-        "STRICTLY READ-ONLY: it never writes to the board, never sends, never touches the ledger."
+        "READ-ONLY TOWARD EVERY COUNTERPARTY: it never writes to the board and never sends to a vendor, a regulator, or anyone involved in a case. The ONE exception is --email below, which mails the finished digest to the profile owner's own address and nowhere else, and therefore does reserve an idempotency entry. It used to say 'never sends, never touches the ledger' full stop; that stopped being true when --email was added and is corrected here rather than left to rot.",
+        "",
+        "2026-07-30: moved to 15:05 UTC-5 and given --email. The user asked for one daily scan",
+        "at 3PM rather than an every-minute poller, on the grounds that vendors reply on",
+        "business timescales and the fast loop was producing noise rather than speed. He was",
+        "right: the every-minute path caught a reply in 60 seconds and drafted a WORSE letter",
+        "than a considered one, and two runtimes both awake is what put three copies of one",
+        "letter in a store manager's inbox.",
+        "",
+        "--email matters as much as the schedule. A digest written to a log on a host nobody",
+        "reads is the same failure as the skip lines that hid an unwatched case for a day."
       ],
       "env_from_file": [
         "MULTICA_TOKEN",
@@ -133,7 +143,9 @@
       "steps": [
         {
           "module": "case_digest.py",
-          "args": [],
+          "args": [
+            "--email"
+          ],
           "output": "log"
         }
       ],
@@ -498,7 +510,6 @@
         "recipient's box. scheduler.py skips a flagged job only when its module is genuinely",
         "absent; here, where drift_gate.py exists, it runs exactly as before."
       ],
-
       "why_on_a_clock": [
         "M51. SKILL.md sec 7 has always said: edit the master only, never a copy, because divergence",
         "between copies is the original sin that split this skill's two predecessors apart. It",
